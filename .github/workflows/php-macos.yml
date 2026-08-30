@@ -102,8 +102,10 @@ jobs:
           # A full FastCGI round trip needs a web server, so it is asserted in
           # the stack repository where Caddy already runs. Here it must at least
           # accept its configuration and hold the port.
-          printf '[global]\ndaemonize = no\n[www]\nlisten = 127.0.0.1:9000\npm = static\npm.max_children = 1\n' \
-            > /tmp/php-fpm.conf
+          # error_log is not optional: without it php-fpm defaults to a path
+          # under /var/log and refuses to start when it cannot open it.
+          printf '[global]\ndaemonize = no\nerror_log = %s\n[www]\nlisten = 127.0.0.1:9000\npm = static\npm.max_children = 1\n' \
+            "$RUNNER_TEMP/php-fpm.log" > /tmp/php-fpm.conf
           buildroot/bin/php-fpm -t -y /tmp/php-fpm.conf
           buildroot/bin/php-fpm -y /tmp/php-fpm.conf &
           fpm_pid=$!
