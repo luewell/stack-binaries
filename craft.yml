@@ -1,0 +1,47 @@
+# The extension set every PHP this foundry builds carries.
+#
+# Laravel names thirteen extensions and a standard build already has all of
+# them. This list exists for what its list does not name and what the public
+# static builds lack: the database drivers.
+#
+# php-version is rewritten by the workflow. Everything else is the same for
+# every version, so a project moving between them finds the same PHP.
+php-version: "8.4"
+
+sapi:
+  - cli
+  - fpm
+
+extensions:
+  - bcmath
+  - ctype
+  - curl
+  - dom
+  - fileinfo
+  - filter
+  - gd
+  - iconv
+  - intl
+  - mbstring
+  - opcache
+  - openssl
+  - pcntl
+  - pdo
+  - pdo_mysql
+  - pdo_pgsql
+  - pdo_sqlite
+  - pgsql
+  - phar
+  - posix
+  - redis
+  - session
+  - simplexml
+  - sockets
+  - sodium
+  - sqlite3
+  - tokenizer
+  - xml
+  - xmlreader
+  - xmlwriter
+  - zip
+  - zlib

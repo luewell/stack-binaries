@@ -1,0 +1,160 @@
+# Builds PHP for macOS, which nobody publishes with the database drivers a
+# Laravel project needs.
+#
+# Run it for a version, then take the digest it prints into the catalogue entry
+# in the stack repository.
+name: PHP for macOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: PHP version to build, as a line like 8.4 or a release like 8.4.13
+        required: true
+        default: "8.4"
+
+permissions:
+  contents: write
+
+env:
+  # Pinned to a release and to the sha256 GitHub publishes for that asset. spc
+  # is a PHP program, so building it here would mean building PHP to build PHP.
+  SPC_VERSION: "2.8.5"
+  SPC_SHA256: "acf2f25d56d0cbf8e65aa82e5054fef555f7be7c5c38046c6e0819f266d83225"
+
+jobs:
+  build:
+    # macos-14 and later are Apple silicon. This project supports no Intel Macs.
+    runs-on: macos-14
+    # PHP is a much longer build than Valkey; GitHub's default ceiling is six hours.
+    timeout-minutes: 120
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Fetch static-php-cli, and refuse it if it is not what we pinned
+        run: |
+          set -euo pipefail
+          archive="spc-macos-aarch64.tar.gz"
+          curl -fsSL -o "$archive" \
+            "https://github.com/crazywhalecc/static-php-cli/releases/download/${SPC_VERSION}/${archive}"
+
+          actual="$(shasum -a 256 "$archive" | awk '{print $1}')"
+          if [ "$actual" != "$SPC_SHA256" ]; then
+            echo "spc ${SPC_VERSION} is not what we pinned:" >&2
+            echo "  expected ${SPC_SHA256}" >&2
+            echo "  got      ${actual}" >&2
+            exit 1
+          fi
+
+          tar -xzf "$archive"
+          chmod +x spc
+          ./spc --version
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          # Only the version line is rewritten; the extension set is reviewed in
+          # craft.yml and is the same for every version.
+          /usr/bin/sed -i '' "s/^php-version: .*/php-version: \"${{ inputs.version }}\"/" craft.yml
+          ./spc craft craft.yml
+
+      - name: Check it does not depend on where it was built
+        run: |
+          set -euo pipefail
+          # A binary naming an absolute library path can only ever be installed
+          # where it was built. DBngin's Redis hardcodes /Users/Shared/DBngin/...
+          # and is pinned to that directory for ever.
+          for binary in buildroot/bin/php buildroot/bin/php-fpm; do
+            if otool -L "$binary" | grep -qE '^[[:space:]]+/(Users|opt|usr/local)/'; then
+              echo "${binary} links against a path outside the system:" >&2
+              otool -L "$binary" >&2
+              exit 1
+            fi
+          done
+          otool -L buildroot/bin/php
+
+      - name: Check every extension we asked for is really there
+        run: |
+          set -euo pipefail
+          buildroot/bin/php -m | tr 'A-Z' 'a-z' | sort -u > /tmp/present.txt
+
+          # Laravel's own list, plus the drivers it does not name and the public
+          # static builds leave out. A build missing one of these is not shipped.
+          missing=""
+          for extension in ctype curl dom fileinfo filter hash mbstring openssl \
+                           pcre pdo session tokenizer xml \
+                           pdo_pgsql pdo_mysql redis intl zip gd bcmath sodium; do
+            grep -qx "$extension" /tmp/present.txt || missing="${missing} ${extension}"
+          done
+
+          if [ -n "$missing" ]; then
+            echo "the build is missing:${missing}" >&2
+            buildroot/bin/php -m >&2
+            exit 1
+          fi
+          echo "all required extensions present"
+          buildroot/bin/php -v
+
+      - name: Check php-fpm starts and listens
+        run: |
+          set -euo pipefail
+          # A full FastCGI round trip needs a web server, so it is asserted in
+          # the stack repository where Caddy already runs. Here it must at least
+          # accept its configuration and hold the port.
+          printf '[global]\ndaemonize = no\n[www]\nlisten = 127.0.0.1:9000\npm = static\npm.max_children = 1\n' \
+            > /tmp/php-fpm.conf
+          buildroot/bin/php-fpm -t -y /tmp/php-fpm.conf
+          buildroot/bin/php-fpm -y /tmp/php-fpm.conf &
+          fpm_pid=$!
+          for _ in $(seq 1 20); do
+            if nc -z 127.0.0.1 9000; then listening=yes; break; fi
+            sleep 0.5
+          done
+          kill "$fpm_pid"
+          [ "${listening:-no}" = yes ] || { echo "php-fpm never listened" >&2; exit 1; }
+          echo "php-fpm accepted its configuration and held the port"
+
+      - name: Package in the layout the catalogue expects
+        id: package
+        run: |
+          set -euo pipefail
+          version="$(buildroot/bin/php -r 'echo PHP_VERSION;')"
+          root="php-${version}-macos-arm64"
+          mkdir -p "${root}/bin"
+          cp buildroot/bin/php buildroot/bin/php-fpm "${root}/bin/"
+
+          # An arm64 binary without at least an ad-hoc signature is killed by
+          # the kernel. The linker signs its own output, but copying can drop it.
+          codesign --force --sign - "${root}/bin/php"
+          codesign --force --sign - "${root}/bin/php-fpm"
+
+          tar -czf "${root}.tar.gz" "${root}"
+          digest="$(shasum -a 256 "${root}.tar.gz" | awk '{print $1}')"
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "archive=${root}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "SHA-256 for the catalogue entry: ${digest}"
+
+      - name: Check it runs after being packed and unpacked
+        run: |
+          set -euo pipefail
+          tar -xzf "${{ steps.package.outputs.archive }}" -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/php-${{ steps.package.outputs.version }}-macos-arm64/bin/php" --version
+
+      # Published with the CLI the runner already carries, rather than a
+      # third-party action: publishing needs write access to this repository,
+      # and that is not a permission to hand to code we do not control.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "php-${{ steps.package.outputs.version }}" \
+            --repo "${{ github.repository }}" \
+            --title "PHP ${{ steps.package.outputs.version }} for macOS" \
+            --notes "Built with static-php-cli ${SPC_VERSION} on macOS arm64, because upstream publishes no macOS binary carrying the database drivers.
+
+          SHA-256: \`${{ steps.package.outputs.digest }}\`" \
+            "${{ steps.package.outputs.archive }}"
