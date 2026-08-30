@@ -5,6 +5,10 @@
 # in the stack repository.
 name: PHP
 
+# Without this every run is listed as "PHP #7" and three versions building at
+# once are told apart only by opening them.
+run-name: PHP ${{ inputs.version }}
+
 on:
   workflow_dispatch:
     inputs:
