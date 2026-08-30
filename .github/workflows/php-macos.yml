@@ -52,6 +52,11 @@ jobs:
           ./spc --version
 
       - name: Build
+        env:
+          # spc asks api.github.com which version of each library to take, and
+          # an unauthenticated runner is refused with a 403 once the shared
+          # allowance is gone. The token only reads public metadata here.
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           # Only the version line is rewritten; the extension set is reviewed in
