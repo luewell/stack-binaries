@@ -29,6 +29,11 @@ jobs:
   # The release is made once, before the builds, so three jobs uploading to it
   # never race to create it. Asked for rather than forced: an exit status that
   # means both "already there" and "something went wrong" cannot be branched on.
+  #
+  # It is made as a draft. Created outright, a run where every build failed left
+  # a version number announced with nothing inside it, and one where a single
+  # platform failed left a release the catalogue could pin a missing URL from.
+  # A draft becomes real only once every build has put its artifact in.
   prepare:
     runs-on: ubuntu-24.04
     outputs:
@@ -63,11 +68,14 @@ jobs:
           echo "version=${resolved}" >> "$GITHUB_OUTPUT"
           echo "${asked} is ${resolved}"
 
+          # One that is already there, draft or published, is left as it is.
+          # Rebuilding a version replaces its files, and forcing a published one
+          # back to draft would take it from anyone already pointing at it.
           if gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             echo "${tag} is already there"
             exit 0
           fi
-          gh release create "$tag" \
+          gh release create "$tag" --draft \
             --repo "${{ github.repository }}" \
             --title "PHP ${resolved}" \
             --notes "Built with static-php-cli ${SPC_VERSION}, because upstream publishes no build carrying the database drivers.
@@ -280,3 +288,27 @@ jobs:
           gh release upload "${{ needs.prepare.outputs.tag }}" \
             "${{ steps.package.outputs.archive }}" \
             --repo "${{ github.repository }}" --clobber
+
+  # A draft with every artifact in it becomes a release. Needing all three means
+  # a partial failure publishes nothing, rather than a version that exists for
+  # some platforms and 404s for the rest.
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Publish the draft, once every platform is in it
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.prepare.outputs.tag }}"
+
+          count="$(gh release view "$tag" --repo "${{ github.repository }}" \
+            --json assets --jq '.assets | length')"
+          if [ "$count" -lt 3 ]; then
+            echo "${tag} holds ${count} artifacts, and three platforms were asked for" >&2
+            exit 1
+          fi
+
+          gh release edit "$tag" --repo "${{ github.repository }}" --draft=false
+          echo "${tag} published with ${count} artifacts"
