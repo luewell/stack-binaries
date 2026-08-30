@@ -29,15 +29,35 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
     steps:
-      - name: Create the release if it is not there
+      # The tag names the exact release, never the line. A catalogue entry pins
+      # a URL, and "php-8.4" would quietly become a different build the day 8.4.26
+      # comes out. php.net resolves a line to the release inside it, so the
+      # answer is known before anything is built.
+      - name: Resolve the version and create the release if it is not there
         id: release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag="php-${{ inputs.version }}"
+          asked="${{ inputs.version }}"
+
+          resolved="$(curl -fsSL "https://www.php.net/releases/index.php?json&version=${asked}" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')"
+
+          case "$resolved" in
+            "$asked"|"$asked".*) ;;
+            *)
+              echo "php.net resolved ${asked} to ${resolved}, which is not inside it" >&2
+              exit 1
+              ;;
+          esac
+
+          tag="php-${resolved}"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${resolved}" >> "$GITHUB_OUTPUT"
+          echo "${asked} is ${resolved}"
 
           if gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             echo "${tag} is already there"
@@ -45,7 +65,7 @@ jobs:
           fi
           gh release create "$tag" \
             --repo "${{ github.repository }}" \
-            --title "PHP ${{ inputs.version }}" \
+            --title "PHP ${resolved}" \
             --notes "Built with static-php-cli ${SPC_VERSION}, because upstream publishes no build carrying the database drivers.
 
           Each asset's SHA-256 is in the job that produced it."
@@ -228,6 +248,11 @@ jobs:
 
           tar -czf "${root}.tar.gz" "${root}"
           digest="$(digest_of "${root}.tar.gz")"
+
+          if [ "$version" != "${{ needs.prepare.outputs.version }}" ]; then
+            echo "built ${version} where the release is for ${{ needs.prepare.outputs.version }}" >&2
+            exit 1
+          fi
 
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "archive=${root}.tar.gz" >> "$GITHUB_OUTPUT"
