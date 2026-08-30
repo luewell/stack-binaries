@@ -51,6 +51,21 @@ jobs:
           chmod +x spc
           ./spc --version
 
+      # Sources and built libraries are kept between runs. Without this every
+      # retry recompiles OpenSSL, ICU and the rest from nothing, so a mistake in
+      # a later step costs a full build to correct.
+      #
+      # The key covers what decides their content: the spc release, the
+      # extension set, and the PHP line. Anything else changing must miss.
+      - name: Reuse what was already downloaded and built
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            downloads
+            buildroot
+            source
+          key: spc-${{ env.SPC_VERSION }}-php-${{ inputs.version }}-${{ hashFiles('craft.yml') }}
+
       - name: Build
         env:
           # spc asks api.github.com which version of each library to take, and
