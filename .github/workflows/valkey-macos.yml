@@ -1,0 +1,92 @@
+# Builds Valkey for macOS, which nobody publishes.
+#
+# Run it for a version, then take the digest it prints into the catalogue entry
+# in the stack repository.
+name: Valkey for macOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Valkey version to build, without the leading v
+        required: true
+        default: "9.1.1"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # macos-14 and later are Apple silicon. This project supports no Intel Macs.
+    runs-on: macos-14
+    # A build takes under a minute; GitHub's default ceiling is six hours.
+    timeout-minutes: 30
+    steps:
+      # Pinned to a commit rather than a tag. A tag moves, and this job holds
+      # write access to this repository; official is a much smaller risk than a
+      # third party's, not no risk. v5 also drops the deprecated Node 20.
+      - name: Check out Valkey
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: valkey-io/valkey
+          ref: ${{ inputs.version }}
+
+      - name: Build
+        run: make -j"$(sysctl -n hw.ncpu)"
+
+      - name: Check it does not depend on where it was built
+        run: |
+          set -euo pipefail
+          # A binary naming an absolute library path can only ever be installed
+          # where it was built. DBngin's Redis hardcodes
+          # /Users/Shared/DBngin/... and is pinned to that directory for ever;
+          # stack installs per version under the user's state directory.
+          if otool -L src/valkey-server | grep -qE '^[[:space:]]+/(Users|opt|usr/local)/'; then
+            echo "valkey-server links against a path outside the system:" >&2
+            otool -L src/valkey-server >&2
+            echo "link statically or through @loader_path before shipping this" >&2
+            exit 1
+          fi
+          otool -L src/valkey-server
+
+      - name: Package in the layout the catalogue expects
+        id: package
+        run: |
+          set -euo pipefail
+          root="valkey-${{ inputs.version }}-macos-arm64"
+          mkdir -p "${root}/bin"
+          cp src/valkey-server src/valkey-cli "${root}/bin/"
+
+          # An arm64 binary without at least an ad-hoc signature is killed by
+          # the kernel. The linker signs its own output, but copying can drop it.
+          codesign --force --sign - "${root}/bin/valkey-server"
+          codesign --force --sign - "${root}/bin/valkey-cli"
+
+          tar -czf "${root}.tar.gz" "${root}"
+          digest="$(shasum -a 256 "${root}.tar.gz" | awk '{print $1}')"
+
+          echo "archive=${root}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "SHA-256 for the catalogue entry: ${digest}"
+
+      - name: Check it runs
+        run: |
+          set -euo pipefail
+          tar -xzf "${{ steps.package.outputs.archive }}" -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/valkey-${{ inputs.version }}-macos-arm64/bin/valkey-server" --version
+
+      # Published with the CLI the runner already carries, rather than a
+      # third-party action: publishing needs write access to this repository,
+      # and that is not a permission to hand to code we do not control.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "valkey-${{ inputs.version }}" \
+            --repo "${{ github.repository }}" \
+            --title "Valkey ${{ inputs.version }} for macOS" \
+            --notes "Built from valkey-io/valkey ${{ inputs.version }} on macOS arm64, because upstream publishes no macOS binary.
+
+          SHA-256: \`${{ steps.package.outputs.digest }}\`" \
+            "${{ steps.package.outputs.archive }}"
