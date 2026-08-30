@@ -157,12 +157,18 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # The exact version prepare resolved, not the line that was asked for.
+          # Resolving it again here would ask a moving source twice: 8.5.10 was
+          # released between prepare and the build, so the release said 8.5.9
+          # and the build produced 8.5.10.
+          #
           # Only the version line is rewritten; the extension set is reviewed in
           # craft.yml and is the same for every version and platform.
+          version="${{ needs.prepare.outputs.version }}"
           if [ "$RUNNER_OS" = macOS ]; then
-            /usr/bin/sed -i '' "s/^php-version: .*/php-version: \"${{ inputs.version }}\"/" craft.yml
+            /usr/bin/sed -i '' "s/^php-version: .*/php-version: \"${version}\"/" craft.yml
           else
-            sed -i "s/^php-version: .*/php-version: \"${{ inputs.version }}\"/" craft.yml
+            sed -i "s/^php-version: .*/php-version: \"${version}\"/" craft.yml
           fi
           ./spc craft craft.yml
 
