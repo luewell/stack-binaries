@@ -220,6 +220,21 @@ jobs:
           echo "all required extensions present"
           buildroot/bin/php -v
 
+          # Present is not the same as able: gd is listed by php -m whether or not
+          # it can read a JPEG, and a build that cannot is only found by whatever
+          # calls imagejpeg months later.
+          buildroot/bin/php -r '
+            $wanted = ["JPEG Support", "PNG Support", "WebP Support", "FreeType Support"];
+            $gd = gd_info();
+            $missing = array_values(array_filter($wanted, fn ($feature) => empty($gd[$feature])));
+            if ($missing) {
+              fwrite(STDERR, "gd was built without: " . implode(", ", $missing) . PHP_EOL);
+              print_r($gd);
+              exit(1);
+            }
+            echo "gd carries ", implode(", ", $wanted), PHP_EOL;
+          '
+
       - name: Check php-fpm starts and listens
         run: |
           set -euo pipefail

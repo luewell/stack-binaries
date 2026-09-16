@@ -12,6 +12,15 @@ sapi:
   - cli
   - fpm
 
+# An extension carries only the libraries it is given. static-php-cli builds to a
+# minimum dependency principle, so gd compiles with zlib and libpng alone and a
+# build carrying gd can still have no imagejpeg. libavif is left out: nothing
+# reads AVIF, and it is the most expensive of the four to build.
+libs:
+  - libjpeg
+  - libwebp
+  - freetype
+
 extensions:
   - bcmath
   - ctype
