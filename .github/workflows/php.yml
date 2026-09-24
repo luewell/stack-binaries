@@ -18,7 +18,11 @@ on:
         default: "8.4"
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.version }}
+  cancel-in-progress: false
 
 env:
   # Pinned to a release and to the sha256 GitHub publishes for each asset. spc
@@ -26,61 +30,46 @@ env:
   SPC_VERSION: "2.8.5"
 
 jobs:
-  # The release is made once, before the builds, so three jobs uploading to it
-  # never race to create it. Asked for rather than forced: an exit status that
-  # means both "already there" and "something went wrong" cannot be branched on.
-  #
-  # It is made as a draft. Created outright, a run where every build failed left
-  # a version number announced with nothing inside it, and one where a single
-  # platform failed left a release the catalogue could pin a missing URL from.
-  # A draft becomes real only once every build has put its artifact in.
   prepare:
     runs-on: ubuntu-24.04
     outputs:
-      tag: ${{ steps.release.outputs.tag }}
-      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
     steps:
       # The tag names the exact release, never the line. A catalogue entry pins
       # a URL, and "php-8.4" would quietly become a different build the day 8.4.26
       # comes out. php.net resolves a line to the release inside it, so the
       # answer is known before anything is built.
-      - name: Resolve the version and create the release if it is not there
-        id: release
+      - name: Resolve the version
+        id: resolve
         env:
-          GH_TOKEN: ${{ github.token }}
+          ASKED: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          asked="${{ inputs.version }}"
+          if [[ ! "$ASKED" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "the version must be a line like 8.4 or a release like 8.4.25" >&2
+            exit 1
+          fi
 
-          resolved="$(curl -fsSL "https://www.php.net/releases/index.php?json&version=${asked}" \
+          resolved="$(curl -fsSL "https://www.php.net/releases/index.php?json&version=${ASKED}" \
             | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')"
 
+          if [[ ! "$resolved" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "php.net resolved ${ASKED} to something that is not a release number" >&2
+            exit 1
+          fi
+
           case "$resolved" in
-            "$asked"|"$asked".*) ;;
+            "$ASKED"|"$ASKED".*) ;;
             *)
-              echo "php.net resolved ${asked} to ${resolved}, which is not inside it" >&2
+              echo "php.net resolved ${ASKED} to ${resolved}, which is not inside it" >&2
               exit 1
               ;;
           esac
 
-          tag="php-${resolved}"
-          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "tag=php-${resolved}" >> "$GITHUB_OUTPUT"
           echo "version=${resolved}" >> "$GITHUB_OUTPUT"
-          echo "${asked} is ${resolved}"
-
-          # One that is already there, draft or published, is left as it is.
-          # Rebuilding a version replaces its files, and forcing a published one
-          # back to draft would take it from anyone already pointing at it.
-          if gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            echo "${tag} is already there"
-            exit 0
-          fi
-          gh release create "$tag" --draft \
-            --repo "${{ github.repository }}" \
-            --title "PHP ${resolved}" \
-            --notes "Built with static-php-cli ${SPC_VERSION}, because upstream publishes no build carrying the database drivers.
-
-          Each asset's SHA-256 is in the job that produced it."
+          echo "${ASKED} is ${resolved}"
 
   build:
     needs: prepare
@@ -106,11 +95,12 @@ jobs:
     # PHP is a long build; GitHub's default ceiling is six hours.
     timeout-minutes: 120
     steps:
-      # Pinned to a commit rather than a tag. A tag moves, and this job holds
-      # write access to this repository; official is a much smaller risk than a
-      # third party's, not no risk.
+      # Pinned to a commit rather than a tag. A tag moves, and official is a
+      # much smaller risk than a third party's, not no risk.
       - name: Check out this repository
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
       # Sources and built libraries are kept between runs. Without this every
       # retry recompiles OpenSSL, ICU and the rest from nothing.
@@ -149,27 +139,33 @@ jobs:
           chmod +x spc
           ./spc --version
 
+      # The exact version prepare resolved, not the line that was asked for.
+      # Resolving it again here would ask a moving source twice: 8.5.10 was
+      # released between prepare and the build, so the release said 8.5.9 and
+      # the build produced 8.5.10.
+      #
+      # Only the version line is rewritten; the extension set is reviewed in
+      # craft.yml and is the same for every version and platform.
+      - name: Point craft.yml at the version prepare resolved
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = macOS ]; then
+            /usr/bin/sed -i '' "s/^php-version: .*/php-version: \"${VERSION}\"/" craft.yml
+          else
+            sed -i "s/^php-version: .*/php-version: \"${VERSION}\"/" craft.yml
+          fi
+
       - name: Build
         env:
           # spc asks api.github.com which version of each library to take, and
           # an unauthenticated runner is refused with a 403 once the shared
-          # allowance is gone. The token only reads public metadata here.
+          # allowance is gone. The token is read-only and only reads public
+          # metadata here.
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # The exact version prepare resolved, not the line that was asked for.
-          # Resolving it again here would ask a moving source twice: 8.5.10 was
-          # released between prepare and the build, so the release said 8.5.9
-          # and the build produced 8.5.10.
-          #
-          # Only the version line is rewritten; the extension set is reviewed in
-          # craft.yml and is the same for every version and platform.
-          version="${{ needs.prepare.outputs.version }}"
-          if [ "$RUNNER_OS" = macOS ]; then
-            /usr/bin/sed -i '' "s/^php-version: .*/php-version: \"${version}\"/" craft.yml
-          else
-            sed -i "s/^php-version: .*/php-version: \"${version}\"/" craft.yml
-          fi
           ./spc craft craft.yml
 
       - name: Check it does not depend on where it was built
@@ -262,6 +258,8 @@ jobs:
 
       - name: Package in the layout the catalogue expects
         id: package
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
           version="$(buildroot/bin/php -r 'echo PHP_VERSION;')"
@@ -282,8 +280,8 @@ jobs:
           tar -czf "${root}.tar.gz" "${root}"
           digest="$(digest_of "${root}.tar.gz")"
 
-          if [ "$version" != "${{ needs.prepare.outputs.version }}" ]; then
-            echo "built ${version} where the release is for ${{ needs.prepare.outputs.version }}" >&2
+          if [ "$version" != "$RELEASE_VERSION" ]; then
+            echo "built ${version} where the release is for ${RELEASE_VERSION}" >&2
             exit 1
           fi
 
@@ -293,43 +291,94 @@ jobs:
           echo "SHA-256 for the catalogue entry (${{ matrix.platform }}): ${digest}"
 
       - name: Check it runs after being packed and unpacked
+        env:
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+          ROOT: ${{ steps.package.outputs.root }}
         run: |
           set -euo pipefail
-          tar -xzf "${{ steps.package.outputs.archive }}" -C "$RUNNER_TEMP"
-          "$RUNNER_TEMP/${{ steps.package.outputs.root }}/bin/php" --version
+          tar -xzf "$ARCHIVE" -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/${ROOT}/bin/php" --version
 
-      # Uploaded with the CLI the runner already carries, rather than a
-      # third-party action: publishing needs write access to this repository,
-      # and that is not a permission to hand to code we do not control.
-      - name: Publish
+      - name: Hand the archive to the release job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: php-${{ matrix.platform }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+
+  # The only job that can write to this repository. The builds run code from
+  # dozens of upstream projects, so this one checks nothing out and runs nothing
+  # they produced; it only moves their archives into the release.
+  #
+  # Needing every build means a partial failure publishes nothing, rather than a
+  # version that exists for some platforms and 404s for the rest.
+  release:
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    # The workflow's own group is keyed on the version asked for, and "8.4" and
+    # "8.4.25" can resolve to the same release.
+    concurrency:
+      group: ${{ github.workflow }}-release-${{ needs.prepare.outputs.tag }}
+      cancel-in-progress: false
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: Take the archives the builds produced
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: php-*
+          path: archives
+          merge-multiple: true
+
+      # Asked for rather than forced: an exit status that means both "already
+      # there" and "something went wrong" cannot be branched on.
+      #
+      # It is made as a draft, so the catalogue cannot pin a URL from it before
+      # every platform is in it. One that is already there, draft or published,
+      # is left as it is. Rebuilding a version replaces its files, and forcing a
+      # published one back to draft would take it from anyone already pointing
+      # at it.
+      - name: Create the release if it is not there
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh release upload "${{ needs.prepare.outputs.tag }}" \
-            "${{ steps.package.outputs.archive }}" \
-            --repo "${{ github.repository }}" --clobber
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "${TAG} is already there"
+            exit 0
+          fi
+          gh release create "$TAG" --draft \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "PHP ${VERSION}" \
+            --notes "Built with static-php-cli ${SPC_VERSION}, because upstream publishes no build carrying the database drivers.
 
-  # A draft with every artifact in it becomes a release. Needing all three means
-  # a partial failure publishes nothing, rather than a version that exists for
-  # some platforms and 404s for the rest.
-  publish:
-    needs: [prepare, build]
-    runs-on: ubuntu-24.04
-    steps:
+          Each asset's SHA-256 is in the job that produced it."
+
+      # Uploaded with the CLI the runner already carries, rather than a
+      # third-party action: publishing needs write access to this repository,
+      # and that is not a permission to hand to code we do not control.
+      - name: Put every platform's archive in it
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" archives/*.tar.gz \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
       - name: Publish the draft, once every platform is in it
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag="${{ needs.prepare.outputs.tag }}"
-
-          count="$(gh release view "$tag" --repo "${{ github.repository }}" \
+          count="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
             --json assets --jq '.assets | length')"
           if [ "$count" -lt 3 ]; then
-            echo "${tag} holds ${count} artifacts, and three platforms were asked for" >&2
+            echo "${TAG} holds ${count} artifacts, and three platforms were asked for" >&2
             exit 1
           fi
 
-          gh release edit "$tag" --repo "${{ github.repository }}" --draft=false
-          echo "${tag} published with ${count} artifacts"
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+          echo "${TAG} published with ${count} artifacts"
