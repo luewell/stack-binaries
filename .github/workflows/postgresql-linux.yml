@@ -1,0 +1,199 @@
+# Repackages the upstream PostgreSQL build for Linux with the libxml2 it links.
+#
+# theseus-rs/postgresql-binaries builds on Debian 12 and links the system's
+# libxml2.so.2, which Ubuntu 26.04 no longer ships: it moved to libxml2.so.16,
+# whose ABI differs. Every binary looks in $ORIGIN/../lib first, so this adds a
+# libxml2.so.2 built from libxml2's own release to lib/ and changes nothing else.
+#
+# Run it for a version listed in postgresql-upstream.json, then take the
+# digests it prints into the catalogue entry.
+name: PostgreSQL for Linux
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: PostgreSQL release to repackage, such as 18.6.0
+        required: true
+        default: "18.6.0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  # The last libxml2 series with the libxml2.so.2 soname, pinned to the sha256
+  # download.gnome.org publishes beside the release.
+  LIBXML2_VERSION: "2.13.9"
+  LIBXML2_SHA256: "a2c9ae7b770da34860050c309f903221c67830c86e4a7e760692b803df95143a"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - triple: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - triple: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    # The glibc upstream built against, so the library asks for nothing newer
+    # than the binaries beside it.
+    container: debian:12
+    timeout-minutes: 30
+    steps:
+      - name: Refuse a version that is not a release number
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -eu
+          if ! printf '%s\n' "$VERSION" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "the version must be a release like 18.6.0" >&2
+            exit 1
+          fi
+
+      - name: Install the build and runtime dependencies
+        run: |
+          set -eu
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            build-essential ca-certificates curl jq xz-utils \
+            libssl3 libgssapi-krb5-2 libzstd1 liblz4-1 libxxhash0 zlib1g libkeyutils1 libreadline8
+
+      # Pinned to a commit rather than a tag. A tag moves, and official is a
+      # much smaller risk than a third party's, not no risk.
+      - name: Check out this repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      # The digest comes from this repository, reviewed, not from the release
+      # the archive is downloaded from.
+      - name: Download the upstream build
+        env:
+          VERSION: ${{ inputs.version }}
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          set -eu
+          expected="$(jq -r --arg version "$VERSION" --arg triple "$TRIPLE" '.[$version][$triple] // empty' postgresql-upstream.json)"
+          if [ -z "$expected" ]; then
+            echo "postgresql-upstream.json pins no ${TRIPLE} build of ${VERSION}" >&2
+            exit 1
+          fi
+          curl -fsSL --proto '=https' --proto-redir '=https' -o upstream.tar.gz \
+            "https://github.com/theseus-rs/postgresql-binaries/releases/download/${VERSION}/postgresql-${VERSION}-${TRIPLE}.tar.gz"
+          printf '%s  upstream.tar.gz\n' "$expected" | sha256sum --check --strict
+
+      - name: Build libxml2
+        run: |
+          set -eu
+          curl -fsSL --proto '=https' --proto-redir '=https' -o libxml2.tar.xz \
+            "https://download.gnome.org/sources/libxml2/${LIBXML2_VERSION%.*}/libxml2-${LIBXML2_VERSION}.tar.xz"
+          printf '%s  libxml2.tar.xz\n' "$LIBXML2_SHA256" | sha256sum --check --strict
+          tar -xf libxml2.tar.xz
+          cd "libxml2-${LIBXML2_VERSION}"
+          # Only what PostgreSQL's xml type calls: no network, no Python, no
+          # ICU or lzma, which would each be one more library to carry.
+          ./configure --prefix="$RUNNER_TEMP/libxml2" --disable-static \
+            --without-python --without-icu --without-lzma --without-zlib \
+            --without-readline --without-http --without-ftp --without-modules
+          make -j"$(nproc)"
+          make install
+
+      - name: Put the library beside the binaries
+        id: package
+        env:
+          VERSION: ${{ inputs.version }}
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          set -eu
+          root="postgresql-${VERSION}-${TRIPLE}"
+          mkdir -p "$root"
+          tar -xzf upstream.tar.gz -C "$root" --strip-components 1
+          strip -o "$root/lib/libxml2.so.2" "$RUNNER_TEMP/libxml2/lib/libxml2.so.${LIBXML2_VERSION}"
+          mkdir -p "$root/share/licenses/libxml2"
+          cp "libxml2-${LIBXML2_VERSION}/Copyright" "$root/share/licenses/libxml2/Copyright"
+
+          resolved="$(ldd "$root/bin/postgres" | awk '$1 == "libxml2.so.2" {print $3}')"
+          if [ "$resolved" != "$(pwd)/$root/bin/../lib/libxml2.so.2" ]; then
+            echo "postgres finds libxml2.so.2 at ${resolved:-nowhere}, not beside it" >&2
+            exit 1
+          fi
+
+          # The same bytes for the same inputs, so a second run can be checked
+          # against the first.
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+            --mtime='2000-01-01 00:00:00 UTC' -cf - "$root" | gzip -n -9 > "${root}.tar.gz"
+          echo "archive=${root}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "root=${root}" >> "$GITHUB_OUTPUT"
+          echo "SHA-256 for the catalogue entry (${TRIPLE}): $(sha256sum "${root}.tar.gz" | awk '{print $1}')"
+
+      # initdb refuses to run as root.
+      - name: Check it initialises and parses XML
+        env:
+          ROOT: ${{ steps.package.outputs.root }}
+        run: |
+          set -eu
+          useradd --create-home probe
+          chown -R probe "$ROOT"
+          su probe -c "
+            set -eu
+            '$ROOT/bin/initdb' -D /home/probe/data -U probe --auth=trust --encoding=UTF8 --no-sync >/dev/null
+            '$ROOT/bin/pg_ctl' -D /home/probe/data -o '-p 55432 -k /tmp -c listen_addresses=' -l /home/probe/log -w start >/dev/null
+            answer=\$('$ROOT/bin/psql' -h /tmp -p 55432 -U probe -d postgres -tAc \"SELECT (xpath('/a/text()', '<a>ok</a>'::xml))[1]::text\")
+            '$ROOT/bin/pg_ctl' -D /home/probe/data -w stop >/dev/null
+            [ \"\$answer\" = ok ]
+          "
+
+      - name: Hand the archive to the release job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: postgresql-${{ matrix.triple }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+
+  # The only job that can write to this repository. The builds run libxml2's
+  # configure and make, so this one checks nothing out and runs nothing they
+  # produced; it only moves their archives into the release.
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Take the archives the builds produced
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: postgresql-*
+          path: archives
+          merge-multiple: true
+
+      # The names and digests are worked out here from the validated version and
+      # the files themselves, not taken from the builds, whose outputs their code
+      # wrote. Both platforms or neither: a release the catalogue could pin half
+      # of would leave the other a missing URL.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          archives=()
+          notes="Upstream theseus-rs/postgresql-binaries ${VERSION} with libxml2 ${LIBXML2_VERSION} in lib/, because Ubuntu 26.04 no longer ships libxml2.so.2."
+          for triple in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            archive="archives/postgresql-${VERSION}-${triple}.tar.gz"
+            [ -f "$archive" ] || { echo "the ${triple} archive is missing" >&2; exit 1; }
+            archives+=("$archive")
+            notes="${notes}
+
+          ${triple}: \`$(sha256sum "$archive" | awk '{print $1}')\`"
+          done
+          gh release create "postgresql-${VERSION}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "PostgreSQL ${VERSION} for Linux" \
+            --notes "$notes" \
+            "${archives[@]}"

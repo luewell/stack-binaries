@@ -24,6 +24,7 @@ here.
 | **Stack** | The CLI itself, for macOS arm64 and Linux amd64 and arm64, released as `stack-<version>`. |
 | **Valkey for macOS** | Valkey publishes Linux builds for Ubuntu noble and nothing else, and its GitHub releases carry no binaries at all. BSD-3, so redistributing a build is a fact rather than a question. |
 | **PHP** | Built with static-php-cli for macOS arm64 and Linux amd64 and arm64, because the public static builds leave out `pdo_pgsql` and `pdo_mysql`. |
+| **PostgreSQL for Linux** | `theseus-rs/postgresql-binaries`' own build, unchanged, with a `libxml2.so.2` built from libxml2's release added to `lib/`: it links that library, which Ubuntu 26.04 replaced with the incompatible `libxml2.so.16`. The upstream archives' digests are pinned in `postgresql-upstream.json`, and the repackaged archive is byte-for-byte reproducible. |
 
 ## How a release is used
 
