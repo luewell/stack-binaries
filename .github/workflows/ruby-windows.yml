@@ -3,7 +3,7 @@
 # RubyInstaller publishes a relocatable Ruby for Windows only as a 7z, which
 # Stack does not extract. This unpacks the upstream archive, whose digest
 # ruby-windows-upstream.json pins, and packs the same tree unchanged into a
-# zip, the same bytes for the same input. Run it for a version listed there,
+# zip, the same bytes for the same input on the same runner image. Run it for a version listed there,
 # then take the digests it prints into the catalogue entry.
 name: Ruby for Windows
 
