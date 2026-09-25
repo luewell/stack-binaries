@@ -34,6 +34,8 @@ jobs:
     # only at the 2019 and 2022 install paths.
     runs-on: windows-2022
     timeout-minutes: 180
+    env:
+      ROOT: php-${{ inputs.version }}-windows-x86_64
     defaults:
       run:
         shell: bash
@@ -56,7 +58,7 @@ jobs:
           persist-credentials: false
 
       - name: Reuse what was already downloaded and built
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             downloads
@@ -112,30 +114,79 @@ jobs:
           .\spc.exe craft craft-windows.yml
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Check it needs only what every Windows has
+      # Saved as soon as the build is done, so a check failing after it does not
+      # cost the next run the build.
+      - name: Keep what was downloaded and built
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            downloads
+            buildroot
+            source
+          key: spc-${{ env.SPC_VERSION }}-php-${{ inputs.version }}-windows-x86_64-${{ hashFiles('craft.yml') }}
+
+      # spc links pgsql and pdo_pgsql against the libpq.dll of EnterpriseDB's
+      # PostgreSQL binaries, which it builds against; that DLL and what it
+      # loads in turn ship beside php.exe, where Windows looks first. Anything
+      # else must be Windows' own or the Visual C++ runtime, which libpq.dll
+      # needs and which, as for the official PHP builds, is installed rather
+      # than shipped: the runner has it in System32, a fresh Windows has not.
+      - name: Gather php.exe and the libraries it loads
         shell: pwsh
         run: |
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
-          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
-          foreach ($binary in 'buildroot\bin\php.exe', 'buildroot\bin\php-cgi.exe') {
-            $dependents = & $dumpbin.FullName /nologo /dependents $binary |
+          $dumpbin = (Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1).FullName
+          $postgres = Get-ChildItem downloads -Filter 'postgresql-*-windows-x64-binaries.zip' | Select-Object -First 1
+          $postgresBin = 'source\postgresql-win\bin'
+          $visualCRuntime = '^(vcruntime140(_1)?|msvcp140(_\w+)?|concrt140)\.dll$'
+
+          New-Item -ItemType Directory -Path "$env:ROOT\bin" | Out-Null
+          Copy-Item buildroot\bin\php.exe, buildroot\bin\php-cgi.exe "$env:ROOT\bin"
+
+          $bundled = [ordered]@{}
+          $runtime = [Collections.Generic.SortedSet[string]]::new()
+          $pending = [Collections.Generic.Queue[string]]::new()
+          $pending.Enqueue("$env:ROOT\bin\php.exe")
+          $pending.Enqueue("$env:ROOT\bin\php-cgi.exe")
+          while ($pending.Count -gt 0) {
+            $binary = $pending.Dequeue()
+            $dependents = & $dumpbin /nologo /dependents $binary |
               Where-Object { $_ -match '^\s+\S+\.dll$' } |
               ForEach-Object { $_.Trim().ToLowerInvariant() }
-            "${binary}: $($dependents -join ' ')"
+            "$(Split-Path $binary -Leaf): $($dependents -join ' ')"
 
-            # The runner has the Visual C++ runtime in System32, which a fresh
-            # Windows has not, so it is refused by name.
-            $foreign = $dependents | Where-Object {
-              $_ -match '^(vcruntime|msvcp|concrt)' -or
-                -not ($_ -like 'api-ms-win-*' -or (Test-Path "$env:SystemRoot\System32\$_"))
+            foreach ($dependent in $dependents) {
+              if ($dependent -like 'api-ms-win-*' -or $bundled.Contains($dependent)) { continue }
+              if ($dependent -match $visualCRuntime) { [void]$runtime.Add($dependent); continue }
+              if (Test-Path "$env:SystemRoot\System32\$dependent") { continue }
+
+              $source = Get-ChildItem $postgresBin -Filter $dependent | Select-Object -First 1
+              if (-not $source) { Write-Error "$binary loads $dependent, which neither Windows nor $($postgres.Name) carries"; exit 1 }
+              Copy-Item $source.FullName "$env:ROOT\bin"
+              $bundled[$dependent] = $true
+              $pending.Enqueue("$env:ROOT\bin\$dependent")
             }
-            if ($foreign) { Write-Error "$binary links libraries Windows does not carry: $foreign"; exit 1 }
           }
+
+          "bundled from $($postgres.Name): $($bundled.Keys -join ' ')"
+          "needs the Visual C++ runtime: $($runtime -join ' ')"
+          @(
+            "The DLLs in bin beside php.exe and php-cgi.exe other than those two come unchanged"
+            "from EnterpriseDB's $($postgres.Name), https://www.enterprisedb.com/download-postgresql-binaries,"
+            "because the pgsql and pdo_pgsql extensions link its libpq:"
+            ""
+            ($bundled.Keys | ForEach-Object { "  $_" })
+            ""
+            "libpq is the PostgreSQL client library, under the PostgreSQL License; the others are the"
+            "libraries it loads, each under its own project's license, with sources published by"
+            "those projects. They need the Visual C++ 2015-2022 runtime, which is not included."
+          ) | Set-Content "$env:ROOT\NOTICE-libraries.txt"
 
       - name: Check every extension we asked for is really there
         run: |
           set -euo pipefail
-          buildroot/bin/php.exe -m | tr -d '\r' | tr 'A-Z' 'a-z' | sort -u > present.txt
+          php="$ROOT/bin/php.exe"
+          "$php" -m | tr -d '\r' | tr 'A-Z' 'a-z' | sort -u > present.txt
 
           missing=""
           for extension in ctype curl dom fileinfo filter hash mbstring openssl \
@@ -146,13 +197,13 @@ jobs:
 
           if [ -n "$missing" ]; then
             echo "the build is missing:${missing}" >&2
-            buildroot/bin/php.exe -m >&2
+            "$php" -m >&2
             exit 1
           fi
           echo "all required extensions present"
-          buildroot/bin/php.exe -v
+          "$php" -v
 
-          buildroot/bin/php.exe -r '
+          "$php" -r '
             $wanted = ["JPEG Support", "PNG Support", "WebP Support", "FreeType Support"];
             $gd = gd_info();
             $missing = array_values(array_filter($wanted, fn ($feature) => empty($gd[$feature])));
@@ -167,7 +218,7 @@ jobs:
       - name: Check php-cgi listens for FastCGI
         shell: pwsh
         run: |
-          $cgi = Start-Process -FilePath buildroot\bin\php-cgi.exe -ArgumentList '-b', '127.0.0.1:9000' -PassThru -NoNewWindow
+          $cgi = Start-Process -FilePath "$env:ROOT\bin\php-cgi.exe" -ArgumentList '-b', '127.0.0.1:9000' -PassThru -NoNewWindow
           $listening = $false
           foreach ($attempt in 1..20) {
             try {
@@ -189,28 +240,24 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
         run: |
-          $built = & buildroot\bin\php.exe -r 'echo PHP_VERSION;'
+          $built = & "$env:ROOT\bin\php.exe" -r 'echo PHP_VERSION;'
           if ($built -ne $env:VERSION) { Write-Error "built $built where the release is for $env:VERSION"; exit 1 }
 
-          $root = "php-$env:VERSION-windows-x86_64"
-          New-Item -ItemType Directory -Path "$root\bin" | Out-Null
-          Copy-Item buildroot\bin\php.exe, buildroot\bin\php-cgi.exe "$root\bin"
-
-          Compress-Archive -Path $root -DestinationPath "$root.zip"
-          $digest = (Get-FileHash "$root.zip" -Algorithm SHA256).Hash.ToLower()
-          "archive=$root.zip" >> $env:GITHUB_OUTPUT
-          "root=$root" >> $env:GITHUB_OUTPUT
+          Compress-Archive -Path $env:ROOT -DestinationPath "$env:ROOT.zip"
+          $digest = (Get-FileHash "$env:ROOT.zip" -Algorithm SHA256).Hash.ToLower()
+          "archive=$env:ROOT.zip" >> $env:GITHUB_OUTPUT
           "SHA-256 for the catalogue entry: $digest"
 
       - name: Check it runs after being packed and unpacked
         shell: pwsh
         env:
           ARCHIVE: ${{ steps.package.outputs.archive }}
-          ROOT: ${{ steps.package.outputs.root }}
         run: |
           Expand-Archive $env:ARCHIVE -DestinationPath $env:RUNNER_TEMP
-          & "$env:RUNNER_TEMP\$env:ROOT\bin\php.exe" --version
+          $modules = & "$env:RUNNER_TEMP\$env:ROOT\bin\php.exe" -m
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($modules -notcontains 'pdo_pgsql') { Write-Error 'the unpacked php.exe has no pdo_pgsql'; exit 1 }
+          'the unpacked php.exe loads pdo_pgsql'
 
       - name: Hand the archive to the release job
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
