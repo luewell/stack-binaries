@@ -3,9 +3,10 @@
 # Stack runs the catalogue's shell scripts on Windows with busybox-w32, which
 # its author publishes only on frippery.org. That site refuses some networks
 # outright, and there a new Windows machine could not run a single service, so
-# the exact builds the catalogue pins are kept here as well. The digests below are the ones the
-# catalogue pinned after the author's GPG-signed SHA256SUM verified; a copy
-# from anywhere else is published only if it matches them byte for byte.
+# the exact builds the catalogue pins are kept here as well. The digests below
+# are the ones the catalogue pinned after the author's GPG-signed SHA256SUM
+# verified; a copy from anywhere else is published only if it matches them
+# byte for byte.
 name: BusyBox for Windows
 
 on:
