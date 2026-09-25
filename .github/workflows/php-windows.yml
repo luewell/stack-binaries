@@ -30,8 +30,9 @@ env:
 jobs:
   build:
     # x64: static-php-cli builds for no other Windows, and Windows on ARM runs
-    # this one under emulation.
-    runs-on: windows-2025
+    # this one under emulation. windows-2022 because spc finds Visual Studio
+    # only at the 2019 and 2022 install paths.
+    runs-on: windows-2022
     timeout-minutes: 180
     defaults:
       run:
