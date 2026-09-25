@@ -1,0 +1,157 @@
+# Builds Valkey for Windows, which nobody publishes.
+#
+# Valkey builds against MSYS2's POSIX runtime, which emulates the fork and unix
+# sockets it relies on; the runtime's two libraries ship beside the binaries.
+# Run it for a version, then take the digest it prints into the catalogue entry
+# in the stack repository.
+name: Valkey for Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Valkey version to build, without the leading v
+        required: true
+        default: "9.1.1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # x64: MSYS2's runtime has no ARM64 build, and Windows on ARM runs this one
+    # under emulation.
+    runs-on: windows-2025
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Refuse a version that is not a release number
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "the version must be a release like 9.1.1, without the leading v" >&2
+            exit 1
+          fi
+
+      - name: Check out Valkey
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: valkey-io/valkey
+          ref: ${{ inputs.version }}
+          persist-credentials: false
+
+      # The runner image carries MSYS2 at C:\msys64; its compiler builds for
+      # the msys runtime rather than natively. _GNU_SOURCE declares dladdr,
+      # which debug.c uses and the runtime only exposes then.
+      - name: Build
+        shell: pwsh
+        env:
+          MSYSTEM: MSYS
+          CHERE_INVOKING: "1"
+        run: |
+          C:\msys64\usr\bin\bash.exe -lc 'pacman -Sy --noconfirm --needed gcc make pkgconf'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          C:\msys64\usr\bin\bash.exe -lc 'make -j"$(nproc)" MALLOC=libc BUILD_TLS=no USE_SYSTEMD=no CFLAGS=-D_GNU_SOURCE'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Check it needs only the runtime it ships with
+        shell: pwsh
+        env:
+          MSYSTEM: MSYS
+          CHERE_INVOKING: "1"
+        run: |
+          # Windows' own libraries resolve under C:\Windows; anything else must
+          # be one of the two runtime libraries the archive carries.
+          $links = C:\msys64\usr\bin\bash.exe -lc 'ldd src/valkey-server.exe src/valkey-cli.exe' | Select-String '=>'
+          $links | ForEach-Object { $_.Line.Trim() }
+          $foreign = $links | Where-Object {
+            $name, $path = ($_.Line -split '=>').Trim()
+            $name -notin @('msys-2.0.dll', 'msys-gcc_s-seh-1.dll') -and $path -notmatch '^/c/windows/'
+          }
+          if ($foreign) { Write-Error "Valkey links libraries this archive does not carry: $foreign"; exit 1 }
+
+      - name: Package in the layout the catalogue expects
+        id: package
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          $root = "valkey-$env:VERSION-windows-x86_64"
+          New-Item -ItemType Directory -Path "$root\bin" | Out-Null
+          Copy-Item src\valkey-server.exe, src\valkey-cli.exe, C:\msys64\usr\bin\msys-2.0.dll, C:\msys64\usr\bin\msys-gcc_s-seh-1.dll "$root\bin"
+          Copy-Item COPYING "$root\COPYING-valkey"
+
+          # msys-2.0.dll is the Cygwin runtime (LGPL-3.0) and msys-gcc_s-seh-1.dll
+          # GCC's runtime library (GPL-3.0 with the runtime library exception);
+          # the notice names the exact packages and where their sources are.
+          $runtime = C:\msys64\usr\bin\bash.exe -lc 'pacman -Q msys2-runtime gcc-libs'
+          @(
+            "bin\msys-2.0.dll and bin\msys-gcc_s-seh-1.dll are MSYS2's runtime libraries, unchanged:"
+            $runtime
+            ""
+            "msys2-runtime is the Cygwin runtime, LGPL-3.0; gcc-libs is GCC's runtime library,"
+            "GPL-3.0 with the GCC Runtime Library Exception. The source of each exact version is"
+            "published by MSYS2 at https://repo.msys2.org/msys/sources/ and in"
+            "https://github.com/msys2/MSYS2-packages."
+          ) | Set-Content "$root\NOTICE-runtime.txt"
+
+          Compress-Archive -Path $root -DestinationPath "$root.zip"
+          $digest = (Get-FileHash "$root.zip" -Algorithm SHA256).Hash.ToLower()
+          "archive=$root.zip" >> $env:GITHUB_OUTPUT
+          "digest=$digest" >> $env:GITHUB_OUTPUT
+          "SHA-256 for the catalogue entry: $digest"
+
+      - name: Check it runs
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        run: |
+          Expand-Archive $env:ARCHIVE -DestinationPath $env:RUNNER_TEMP
+          & "$env:RUNNER_TEMP\valkey-$env:VERSION-windows-x86_64\bin\valkey-server.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Hand the archive to the release job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: valkey-windows-x86_64
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+
+  # The only job that can write to this repository. It checks nothing out and
+  # runs nothing the build produced; it only moves the archive into a release
+  # of its own, since a published release cannot take another asset.
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Take the archive the build produced
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: valkey-windows-x86_64
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          archive="valkey-${VERSION}-windows-x86_64.zip"
+          digest="$(sha256sum "$archive" | awk '{print $1}')"
+          gh release create "valkey-${VERSION}-windows" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Valkey ${VERSION} for Windows" \
+            --notes "Built from valkey-io/valkey ${VERSION} with MSYS2 on Windows x64, because upstream publishes no Windows binary. The archive carries MSYS2's runtime libraries; NOTICE-runtime.txt names them and their sources.
+
+          SHA-256: \`${digest}\`" \
+            "$archive"
