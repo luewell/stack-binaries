@@ -1,0 +1,92 @@
+# Mirrors the busybox-w32 builds the catalogue pins, unchanged.
+#
+# Stack runs the catalogue's shell scripts on Windows with busybox-w32, which
+# its author publishes only on frippery.org. When that site is unreachable a
+# new Windows machine cannot run a single service, so the exact builds the
+# catalogue pins are kept here as well. The digests below are the ones the
+# catalogue pinned after the author's GPG-signed SHA256SUM verified; a copy
+# from anywhere else is published only if it matches them byte for byte.
+name: BusyBox for Windows
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  RELEASE: FRP-6075-g169694ebd
+  AMD64_DIGEST: 07bb1e5b095b00d68a695481f9240879f33c5724b40aa2308f999d54ed78f075
+  ARM64_DIGEST: e67f873d19d58c535cc9f0c4965ffd622e19b7bab87e3da89cb2185fb54464d7
+
+jobs:
+  mirror:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      # frippery.org first; the Internet Archive's copy of the same URL when
+      # the site refuses. Either way only the pinned bytes pass.
+      - name: Download the pinned builds
+        run: |
+          set -euo pipefail
+          for build in "w64:${AMD64_DIGEST}" "w64a:${ARM64_DIGEST}"; do
+            flavour="${build%%:*}"
+            expected="${build#*:}"
+            name="busybox-${flavour}-${RELEASE}.exe"
+            origin="https://frippery.org/files/busybox/${name}"
+
+            if ! curl -fsSL --proto '=https' --proto-redir '=https' -o "$name" "$origin"; then
+              echo "${origin} refused; taking the Internet Archive's copy"
+              curl -fsSL --proto '=https' --proto-redir '=https' -o "$name" \
+                "https://web.archive.org/web/2026id_/${origin}"
+            fi
+            printf '%s  %s\n' "$expected" "$name" | sha256sum --check --strict
+          done
+
+      # busybox-w32 is GPL-2.0: its source travels with the binaries.
+      - name: Take the source of the same release
+        run: |
+          set -euo pipefail
+          curl -fsSL --proto '=https' --proto-redir '=https' -o "busybox-w32-${RELEASE}-source.tar.gz" \
+            "https://github.com/rmyorston/busybox-w32/archive/refs/tags/${RELEASE}.tar.gz"
+          tar -tzf "busybox-w32-${RELEASE}-source.tar.gz" | grep -qx "busybox-w32-${RELEASE}/LICENSE"
+
+      - name: Hand the files to the release job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: busybox-windows
+          path: |
+            busybox-*.exe
+            busybox-w32-*-source.tar.gz
+          if-no-files-found: error
+
+  # The only job that can write to this repository. It checks nothing out and
+  # runs nothing it received; it only publishes the files.
+  release:
+    needs: mirror
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Take the files the mirror job verified
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: busybox-windows
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "busybox-w32-${RELEASE}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "busybox-w32 ${RELEASE}" \
+            --notes "Ron Yorston's busybox-w32 ${RELEASE} for Windows, unchanged: the builds frippery.org publishes, mirrored because Stack needs them to run a service on Windows. GPL-2.0; the source of the same release is attached, from https://github.com/rmyorston/busybox-w32.
+
+          busybox-w64-${RELEASE}.exe: \`${AMD64_DIGEST}\`
+          busybox-w64a-${RELEASE}.exe: \`${ARM64_DIGEST}\`" \
+            "busybox-w64-${RELEASE}.exe" "busybox-w64a-${RELEASE}.exe" "busybox-w32-${RELEASE}-source.tar.gz"
