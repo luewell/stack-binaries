@@ -1,9 +1,9 @@
 # Mirrors the busybox-w32 builds the catalogue pins, unchanged.
 #
 # Stack runs the catalogue's shell scripts on Windows with busybox-w32, which
-# its author publishes only on frippery.org. When that site is unreachable a
-# new Windows machine cannot run a single service, so the exact builds the
-# catalogue pins are kept here as well. The digests below are the ones the
+# its author publishes only on frippery.org. That site refuses some networks
+# outright, and there a new Windows machine could not run a single service, so
+# the exact builds the catalogue pins are kept here as well. The digests below are the ones the
 # catalogue pinned after the author's GPG-signed SHA256SUM verified; a copy
 # from anywhere else is published only if it matches them byte for byte.
 name: BusyBox for Windows
@@ -53,7 +53,7 @@ jobs:
           set -euo pipefail
           curl -fsSL --proto '=https' --proto-redir '=https' -o "busybox-w32-${RELEASE}-source.tar.gz" \
             "https://github.com/rmyorston/busybox-w32/archive/refs/tags/${RELEASE}.tar.gz"
-          tar -tzf "busybox-w32-${RELEASE}-source.tar.gz" | grep -qx "busybox-w32-${RELEASE}/LICENSE"
+          tar -tzf "busybox-w32-${RELEASE}-source.tar.gz" | grep -x "busybox-w32-${RELEASE}/LICENSE"
 
       - name: Hand the files to the release job
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
