@@ -114,6 +114,15 @@ jobs:
           .\spc.exe craft craft-windows.yml
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # spc keeps the compiler's output in its logs rather than on the console.
+      - name: Keep spc's logs when the build fails
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: spc-logs
+          path: log
+          if-no-files-found: ignore
+
       # Saved as soon as the build is done, so a check failing after it does not
       # cost the next run the build.
       - name: Keep what was downloaded and built
@@ -169,6 +178,13 @@ jobs:
           }
 
           "bundled from $($postgres.Name): $($bundled.Keys -join ' ')"
+
+          # The notice below names these libraries and their licenses.
+          $named = 'libcrypto-3-x64.dll libiconv-2.dll libintl-9.dll libpq.dll libssl-3-x64.dll libwinpthread-1.dll'
+          if ((@($bundled.Keys) | Sort-Object) -join ' ' -ne $named) {
+            Write-Error "the bundled libraries are no longer the ones the notice names ($named); update it"
+            exit 1
+          }
           "needs the Visual C++ runtime: $($runtime -join ' ')"
           @(
             "The DLLs in bin beside php.exe and php-cgi.exe other than those two come unchanged"
@@ -177,9 +193,12 @@ jobs:
             ""
             ($bundled.Keys | ForEach-Object { "  $_" })
             ""
-            "libpq is the PostgreSQL client library, under the PostgreSQL License; the others are the"
-            "libraries it loads, each under its own project's license, with sources published by"
-            "those projects. They need the Visual C++ 2015-2022 runtime, which is not included."
+            "libpq is PostgreSQL's client library, under the PostgreSQL License. libssl and libcrypto"
+            "are OpenSSL 3, under the Apache License 2.0. libintl is GNU gettext's and libiconv GNU"
+            "libiconv, both under the LGPL 2.1 or later. libwinpthread is mingw-w64's winpthreads,"
+            "under the MIT License. Each project publishes its license and sources: postgresql.org,"
+            "openssl.org, gnu.org/software/gettext, gnu.org/software/libiconv and mingw-w64.org."
+            "They need the Visual C++ 2015-2022 runtime, which is not included."
           ) | Set-Content "$env:ROOT\NOTICE-libraries.txt"
 
       - name: Check every extension we asked for is really there
