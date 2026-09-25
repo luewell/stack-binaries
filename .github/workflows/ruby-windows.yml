@@ -49,20 +49,20 @@ jobs:
 
       # The digests come from this repository, reviewed, not from the release
       # the archives are downloaded from. A version without an ARM64 build
-      # pins only x64.
+      # pins only x64. jq ends its lines with CRLF on Windows.
       - name: Download the upstream builds
         env:
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          architectures="$(jq -r --arg version "$VERSION" '.[$version] // {} | keys[]' ruby-windows-upstream.json)"
+          architectures="$(jq -r --arg version "$VERSION" '.[$version] // {} | keys[]' ruby-windows-upstream.json | tr -d '\r')"
           if [ -z "$architectures" ]; then
             echo "ruby-windows-upstream.json pins no build of ${VERSION}" >&2
             exit 1
           fi
 
           for architecture in $architectures; do
-            expected="$(jq -r --arg version "$VERSION" --arg architecture "$architecture" '.[$version][$architecture]' ruby-windows-upstream.json)"
+            expected="$(jq -r --arg version "$VERSION" --arg architecture "$architecture" '.[$version][$architecture]' ruby-windows-upstream.json | tr -d '\r')"
             upstream="rubyinstaller-${VERSION}-1-${architecture}.7z"
             curl -fsSL --proto '=https' --proto-redir '=https' -o "$upstream" \
               "https://github.com/oneclick/rubyinstaller2/releases/download/RubyInstaller-${VERSION}-1/${upstream}"
