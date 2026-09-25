@@ -1,0 +1,246 @@
+# Builds PHP for Windows with the same extensions as the other platforms.
+#
+# The official Windows builds keep each extension in a DLL that only a php.ini
+# naming it loads, and carry no redis; static-php-cli links them all into
+# php.exe, as on macOS and Linux. Windows has no php-fpm, so php-cgi.exe, which
+# speaks FastCGI there, ships instead. Run it for a release the catalogue
+# already pins, then take the digest it prints into that entry.
+name: PHP for Windows
+
+run-name: PHP ${{ inputs.version }} for Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: PHP release to build, like 8.4.25
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  SPC_VERSION: "2.8.5"
+  SPC_DIGEST: 425b54ab857e21409c1fd9b818899ffebabd1e2817ef0a0ed5ae8a3d9f5b463b
+
+jobs:
+  build:
+    # x64: static-php-cli builds for no other Windows, and Windows on ARM runs
+    # this one under emulation.
+    runs-on: windows-2025
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # An exact release rather than a line: the release this makes sits beside
+      # the one php.yml made for the same version, and the catalogue pins both.
+      - name: Refuse a version that is not a release number
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "the version must be a release like 8.4.25" >&2
+            exit 1
+          fi
+
+      - name: Check out this repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Reuse what was already downloaded and built
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            downloads
+            buildroot
+            source
+          key: spc-${{ env.SPC_VERSION }}-php-${{ inputs.version }}-windows-x86_64-${{ hashFiles('craft.yml') }}
+
+      - name: Fetch static-php-cli, and refuse it if it is not what we pinned
+        run: |
+          set -euo pipefail
+          curl -fsSL -o spc.exe \
+            "https://github.com/crazywhalecc/static-php-cli/releases/download/${SPC_VERSION}/spc-windows-x64.exe"
+
+          actual="$(sha256sum spc.exe | awk '{print $1}')"
+          if [ "$actual" != "$SPC_DIGEST" ]; then
+            echo "spc ${SPC_VERSION} is not what we pinned:" >&2
+            echo "  expected ${SPC_DIGEST}" >&2
+            echo "  got      ${actual}" >&2
+            exit 1
+          fi
+          ./spc.exe --version
+
+      # craft.yml stays the one extension set; Windows leaves out the two
+      # extensions that exist only on Unix, and builds cgi where it has no fpm.
+      - name: Derive the Windows craft from craft.yml
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          sed -e "s/^php-version: .*/php-version: \"${VERSION}\"/" \
+              -e 's/^  - fpm$/  - cgi/' \
+              -e '/^  - pcntl$/d' \
+              -e '/^  - posix$/d' \
+              craft.yml > craft-windows.yml
+
+          if grep -qE '^  - (fpm|pcntl|posix)$' craft-windows.yml || ! grep -qx '  - cgi' craft-windows.yml; then
+            echo "craft.yml no longer has the shape this step rewrites:" >&2
+            cat craft-windows.yml >&2
+            exit 1
+          fi
+          cat craft-windows.yml
+
+      - name: Build
+        env:
+          # spc asks api.github.com which version of each library to take; the
+          # token is read-only and only reads public metadata here.
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ./spc.exe craft craft-windows.yml
+
+      - name: Check it needs only what every Windows has
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
+          foreach ($binary in 'buildroot\bin\php.exe', 'buildroot\bin\php-cgi.exe') {
+            $dependents = & $dumpbin.FullName /nologo /dependents $binary |
+              Where-Object { $_ -match '^\s+\S+\.dll$' } |
+              ForEach-Object { $_.Trim().ToLowerInvariant() }
+            "${binary}: $($dependents -join ' ')"
+
+            # The runner has the Visual C++ runtime in System32, which a fresh
+            # Windows has not, so it is refused by name.
+            $foreign = $dependents | Where-Object {
+              $_ -match '^(vcruntime|msvcp|concrt)' -or
+                -not ($_ -like 'api-ms-win-*' -or (Test-Path "$env:SystemRoot\System32\$_"))
+            }
+            if ($foreign) { Write-Error "$binary links libraries Windows does not carry: $foreign"; exit 1 }
+          }
+
+      - name: Check every extension we asked for is really there
+        run: |
+          set -euo pipefail
+          buildroot/bin/php.exe -m | tr -d '\r' | tr 'A-Z' 'a-z' | sort -u > present.txt
+
+          missing=""
+          for extension in ctype curl dom fileinfo filter hash mbstring openssl \
+                           pcre pdo session tokenizer xml \
+                           pdo_pgsql pdo_mysql redis intl zip gd bcmath sodium; do
+            grep -qx "$extension" present.txt || missing="${missing} ${extension}"
+          done
+
+          if [ -n "$missing" ]; then
+            echo "the build is missing:${missing}" >&2
+            buildroot/bin/php.exe -m >&2
+            exit 1
+          fi
+          echo "all required extensions present"
+          buildroot/bin/php.exe -v
+
+          buildroot/bin/php.exe -r '
+            $wanted = ["JPEG Support", "PNG Support", "WebP Support", "FreeType Support"];
+            $gd = gd_info();
+            $missing = array_values(array_filter($wanted, fn ($feature) => empty($gd[$feature])));
+            if ($missing) {
+              fwrite(STDERR, "gd was built without: " . implode(", ", $missing) . PHP_EOL);
+              print_r($gd);
+              exit(1);
+            }
+            echo "gd carries ", implode(", ", $wanted), PHP_EOL;
+          '
+
+      - name: Check php-cgi listens for FastCGI
+        shell: pwsh
+        run: |
+          $cgi = Start-Process -FilePath buildroot\bin\php-cgi.exe -ArgumentList '-b', '127.0.0.1:9000' -PassThru -NoNewWindow
+          $listening = $false
+          foreach ($attempt in 1..20) {
+            try {
+              $client = [Net.Sockets.TcpClient]::new('127.0.0.1', 9000)
+              $client.Dispose()
+              $listening = $true
+              break
+            } catch {
+              Start-Sleep -Milliseconds 500
+            }
+          }
+          Stop-Process -Id $cgi.Id -Force
+          if (-not $listening) { Write-Error 'php-cgi never listened'; exit 1 }
+          'php-cgi held the port'
+
+      - name: Package in the layout the catalogue expects
+        id: package
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          $built = & buildroot\bin\php.exe -r 'echo PHP_VERSION;'
+          if ($built -ne $env:VERSION) { Write-Error "built $built where the release is for $env:VERSION"; exit 1 }
+
+          $root = "php-$env:VERSION-windows-x86_64"
+          New-Item -ItemType Directory -Path "$root\bin" | Out-Null
+          Copy-Item buildroot\bin\php.exe, buildroot\bin\php-cgi.exe "$root\bin"
+
+          Compress-Archive -Path $root -DestinationPath "$root.zip"
+          $digest = (Get-FileHash "$root.zip" -Algorithm SHA256).Hash.ToLower()
+          "archive=$root.zip" >> $env:GITHUB_OUTPUT
+          "root=$root" >> $env:GITHUB_OUTPUT
+          "SHA-256 for the catalogue entry: $digest"
+
+      - name: Check it runs after being packed and unpacked
+        shell: pwsh
+        env:
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+          ROOT: ${{ steps.package.outputs.root }}
+        run: |
+          Expand-Archive $env:ARCHIVE -DestinationPath $env:RUNNER_TEMP
+          & "$env:RUNNER_TEMP\$env:ROOT\bin\php.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Hand the archive to the release job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: php-windows-x86_64
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+
+  # The only job that can write to this repository. It checks nothing out and
+  # runs nothing the build produced; it only moves the archive into a release
+  # of its own, since the release php.yml made for the version takes no new
+  # asset once published.
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Take the archive the build produced
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: php-windows-x86_64
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          archive="php-${VERSION}-windows-x86_64.zip"
+          digest="$(sha256sum "$archive" | awk '{print $1}')"
+          gh release create "php-${VERSION}-windows" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "PHP ${VERSION} for Windows" \
+            --notes "Built with static-php-cli ${SPC_VERSION} on Windows x64, with the extensions of the other platforms' builds but pcntl and posix, which exist only on Unix. php-cgi.exe serves FastCGI, since Windows has no php-fpm.
+
+          SHA-256: \`${digest}\`" \
+            "$archive"
