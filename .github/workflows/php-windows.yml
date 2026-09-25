@@ -64,7 +64,7 @@ jobs:
             downloads
             buildroot
             source
-          key: spc-${{ env.SPC_VERSION }}-php-${{ inputs.version }}-windows-x86_64-${{ hashFiles('craft.yml') }}
+          key: spc-${{ env.SPC_VERSION }}-php-${{ inputs.version }}-windows-x86_64-${{ hashFiles('craft.yml', 'php-windows-intl.php') }}
 
       - name: Fetch static-php-cli, and refuse it if it is not what we pinned
         run: |
@@ -82,7 +82,8 @@ jobs:
           ./spc.exe --version
 
       # craft.yml stays the one extension set; Windows leaves out the two
-      # extensions that exist only on Unix, and builds cgi where it has no fpm.
+      # extensions that exist only on Unix, builds cgi where it has no fpm, and
+      # patches intl before 8.4 (php-windows-intl.php).
       - name: Derive the Windows craft from craft.yml
         env:
           VERSION: ${{ inputs.version }}
@@ -93,6 +94,8 @@ jobs:
               -e '/^  - pcntl$/d' \
               -e '/^  - posix$/d' \
               craft.yml > craft-windows.yml
+
+          printf 'build-options:\n  with-added-patch:\n    - php-windows-intl.php\n' >> craft-windows.yml
 
           if grep -qE '^  - (fpm|pcntl|posix)$' craft-windows.yml || ! grep -qx '  - cgi' craft-windows.yml; then
             echo "craft.yml no longer has the shape this step rewrites:" >&2
@@ -109,14 +112,8 @@ jobs:
           # spc asks api.github.com which version of each library to take; the
           # token is read-only and only reads public metadata here.
           GITHUB_TOKEN: ${{ github.token }}
-          VERSION: ${{ inputs.version }}
         run: |
           $env:PATH = "$env:SystemRoot\System32;$env:PATH"
-
-          # The ICU spc builds intl against needs C++17, which PHP asks for
-          # itself only from 8.4; cl takes extra options from CL.
-          if ([version]$env:VERSION -lt [version]'8.4') { $env:CL = '/std:c++17' }
-
           .\spc.exe craft craft-windows.yml
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
@@ -138,7 +135,7 @@ jobs:
             downloads
             buildroot
             source
-          key: spc-${{ env.SPC_VERSION }}-php-${{ inputs.version }}-windows-x86_64-${{ hashFiles('craft.yml') }}
+          key: spc-${{ env.SPC_VERSION }}-php-${{ inputs.version }}-windows-x86_64-${{ hashFiles('craft.yml', 'php-windows-intl.php') }}
 
       # spc links pgsql and pdo_pgsql against the libpq.dll of EnterpriseDB's
       # PostgreSQL binaries, which it builds against; that DLL and what it
