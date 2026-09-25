@@ -109,8 +109,14 @@ jobs:
           # spc asks api.github.com which version of each library to take; the
           # token is read-only and only reads public metadata here.
           GITHUB_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
         run: |
           $env:PATH = "$env:SystemRoot\System32;$env:PATH"
+
+          # The ICU spc builds intl against needs C++17, which PHP asks for
+          # itself only from 8.4; cl takes extra options from CL.
+          if ([version]$env:VERSION -lt [version]'8.4') { $env:CL = '/std:c++17' }
+
           .\spc.exe craft craft-windows.yml
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
