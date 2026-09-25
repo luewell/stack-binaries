@@ -99,14 +99,18 @@ jobs:
           fi
           cat craft-windows.yml
 
+      # spc unpacks sources through the tar on PATH, and Git's GNU tar reads
+      # D:\ as a remote host; Windows' own tar is the one it expects.
       - name: Build
+        shell: pwsh
         env:
           # spc asks api.github.com which version of each library to take; the
           # token is read-only and only reads public metadata here.
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
-          ./spc.exe craft craft-windows.yml
+          $env:PATH = "$env:SystemRoot\System32;$env:PATH"
+          .\spc.exe craft craft-windows.yml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Check it needs only what every Windows has
         shell: pwsh
