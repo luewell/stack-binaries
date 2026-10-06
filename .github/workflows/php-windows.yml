@@ -1,4 +1,5 @@
-# Builds PHP for Windows with the same extensions as the other platforms.
+# Builds PHP for Windows with the extensions of the other platforms but gmp,
+# pcntl and posix.
 #
 # The official Windows builds keep each extension in a DLL that only a php.ini
 # naming it loads, and carry no redis; static-php-cli links them all into
@@ -82,8 +83,9 @@ jobs:
           ./spc.exe --version
 
       # craft.yml stays the one extension set; Windows leaves out the two
-      # extensions that exist only on Unix, builds cgi where it has no fpm, and
-      # patches intl before 8.4 (php-windows-intl.php).
+      # extensions that exist only on Unix and gmp, whose library static-php-cli
+      # does not build for Windows, builds cgi where it has no fpm, and patches
+      # intl before 8.4 (php-windows-intl.php).
       - name: Derive the Windows craft from craft.yml
         env:
           VERSION: ${{ inputs.version }}
@@ -93,11 +95,12 @@ jobs:
               -e 's/^  - fpm$/  - cgi/' \
               -e '/^  - pcntl$/d' \
               -e '/^  - posix$/d' \
+              -e '/^  - gmp$/d' \
               craft.yml > craft-windows.yml
 
           printf 'build-options:\n  with-added-patch:\n    - php-windows-intl.php\n' >> craft-windows.yml
 
-          if grep -qE '^  - (fpm|pcntl|posix)$' craft-windows.yml || ! grep -qx '  - cgi' craft-windows.yml; then
+          if grep -qE '^  - (fpm|gmp|pcntl|posix)$' craft-windows.yml || ! grep -qx '  - cgi' craft-windows.yml; then
             echo "craft.yml no longer has the shape this step rewrites:" >&2
             cat craft-windows.yml >&2
             exit 1
@@ -237,6 +240,16 @@ jobs:
             echo "gd carries ", implode(", ", $wanted), PHP_EOL;
           '
 
+          # mbregex is not listed by php -m: mbstring is there either way, and
+          # only mb_split shows whether it was built with oniguruma.
+          "$php" -r '
+            if (!function_exists("mb_split") || mb_split("-", "a-b") !== ["a", "b"]) {
+              fwrite(STDERR, "mbstring was built without mbregex (oniguruma)" . PHP_EOL);
+              exit(1);
+            }
+            echo "mbstring carries mbregex", PHP_EOL;
+          '
+
       - name: Check php-cgi listens for FastCGI
         shell: pwsh
         run: |
@@ -314,7 +327,7 @@ jobs:
           gh release create "php-${VERSION}-windows" \
             --repo "$GITHUB_REPOSITORY" \
             --title "PHP ${VERSION} for Windows" \
-            --notes "Built with static-php-cli ${SPC_VERSION} on Windows x64, with the extensions of the other platforms' builds but pcntl and posix, which exist only on Unix. php-cgi.exe serves FastCGI, since Windows has no php-fpm.
+            --notes "Built with static-php-cli ${SPC_VERSION} on Windows x64, with the extensions of the other platforms' builds but pcntl and posix, which exist only on Unix, and gmp, whose library static-php-cli does not build for Windows. php-cgi.exe serves FastCGI, since Windows has no php-fpm.
 
           SHA-256: \`${digest}\`" \
             "$archive"

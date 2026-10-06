@@ -204,7 +204,7 @@ jobs:
           missing=""
           for extension in ctype curl dom fileinfo filter hash mbstring openssl \
                            pcre pdo session tokenizer xml \
-                           pdo_pgsql pdo_mysql redis intl zip gd bcmath sodium; do
+                           pdo_pgsql pdo_mysql redis intl zip gd gmp bcmath sodium; do
             grep -qx "$extension" present.txt || missing="${missing} ${extension}"
           done
 
@@ -229,6 +229,16 @@ jobs:
               exit(1);
             }
             echo "gd carries ", implode(", ", $wanted), PHP_EOL;
+          '
+
+          # mbregex is not listed by php -m: mbstring is there either way, and
+          # only mb_split shows whether it was built with oniguruma.
+          buildroot/bin/php -r '
+            if (!function_exists("mb_split") || mb_split("-", "a-b") !== ["a", "b"]) {
+              fwrite(STDERR, "mbstring was built without mbregex (oniguruma)" . PHP_EOL);
+              exit(1);
+            }
+            echo "mbstring carries mbregex", PHP_EOL;
           '
 
       - name: Check php-fpm starts and listens

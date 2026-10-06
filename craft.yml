@@ -29,9 +29,14 @@ extensions:
   - fileinfo
   - filter
   - gd
+  - gmp
   - iconv
   - intl
   - mbstring
+  # Not an extension of its own: it builds oniguruma and configures mbstring with
+  # --enable-mbregex, without which there is no mb_split, which Laravel's
+  # Str::studly calls.
+  - mbregex
   - opcache
   - openssl
   - pcntl
