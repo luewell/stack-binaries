@@ -3,15 +3,19 @@
     <channel>
         <title>Mac Cleaner</title>
         <item>
-            <title>0.1.1</title>
-            <pubDate>Sat, 17 Oct 2026 16:24:06 -0300</pubDate>
+            <title>0.1.2</title>
+            <pubDate>Sat, 17 Oct 2026 16:51:55 -0300</pubDate>
             <link>https://github.com/luewell/stack-binaries</link>
-            <sparkle:version>19</sparkle:version>
-            <sparkle:shortVersionString>0.1.1</sparkle:shortVersionString>
+            <sparkle:version>26</sparkle:version>
+            <sparkle:shortVersionString>0.1.2</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
-            <description sparkle:format="markdown"><![CDATA[- No feature changes; this release confirms that Mac Cleaner updates itself through Sparkle
+            <description sparkle:format="markdown"><![CDATA[- Applications › Updates finds newer versions of your apps from Homebrew, Sparkle update feeds, and the App Store, updates Homebrew apps in place, and checks once a day
+- Settings can switch the app language between macOS's language, English, and Spanish
+- Clicking a bar in the Overview's recoverable chart opens that category in Cleanup
+- Space Lens no longer asks for access to the TV app's library
+- The sidebar uses sentence case, and empty sizes read 0 bytes
 ]]></description>
-            <enclosure url="https://github.com/luewell/stack-binaries/releases/download/mac-cleaner-0.1.1/MacCleaner-0.1.1.dmg" length="4927197" type="application/octet-stream" sparkle:edSignature="+y11l3etSt1eTMg2rxIUMfqMb4fHmXvFQq5x6T0BQ3/VNeUIWBA6F9eDh2t/PyXJBP2kqeTAQSI2FYvmrBYHAw=="/>
+            <enclosure url="https://github.com/luewell/stack-binaries/releases/download/mac-cleaner-0.1.2/MacCleaner-0.1.2.dmg" length="5117103" type="application/octet-stream" sparkle:edSignature="JJWQSHR9nzteJYS5hHX5JOBKqmF+xH9B1gtcZSgDw/dSxcJevVsOCzT+Qb3zUGtMn2R1kMm06HY7wiwELHK4Bw=="/>
         </item>
     </channel>
 </rss>
