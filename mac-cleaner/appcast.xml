@@ -3,18 +3,17 @@
     <channel>
         <title>Mac Cleaner</title>
         <item>
-            <title>0.1.4</title>
-            <pubDate>Sat, 17 Oct 2026 17:14:48 -0300</pubDate>
+            <title>0.1.5</title>
+            <pubDate>Sat, 17 Oct 2026 17:57:37 -0300</pubDate>
             <link>https://github.com/luewell/stack-binaries</link>
-            <sparkle:version>33</sparkle:version>
-            <sparkle:shortVersionString>0.1.4</sparkle:shortVersionString>
+            <sparkle:version>38</sparkle:version>
+            <sparkle:shortVersionString>0.1.5</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
-            <description sparkle:format="markdown"><![CDATA[- Performance shows live CPU, memory, storage, and battery cards and splits into Summary, Apps, Startup, and Maintenance tabs
-- Quick Look previews files from My Clutter and Space Lens: click a file, press Space, or click its bar in Space Lens
-- Space Lens selects items with checkboxes, and clicking a row opens the folder or previews the file
-- The main window stays between 1000×680 and 1600×1100
+            <description sparkle:format="markdown"><![CDATA[- Smart Scan checks Cleanup, My Clutter, app updates, and performance at once from the Overview or the menu bar, with Clean Safe Items for the caches, logs, and Xcode builds it finds
+- When Mac Cleaner opens at login, it starts in the menu bar without its window
+- The menu bar shows recoverable space right after launch
 ]]></description>
-            <enclosure url="https://github.com/luewell/stack-binaries/releases/download/mac-cleaner-0.1.4/MacCleaner-0.1.4.dmg" length="5195111" type="application/octet-stream" sparkle:edSignature="hA/2MZLCKPbP+QraW2a8OVq9SIiuTc4MO3cy7nqNWfGuwip2qwFMb4TLkSS0YRp7u7gWVZl1fkvHmbK9n3FkCg=="/>
+            <enclosure url="https://github.com/luewell/stack-binaries/releases/download/mac-cleaner-0.1.5/MacCleaner-0.1.5.dmg" length="5284631" type="application/octet-stream" sparkle:edSignature="JHAG2ChDhfCf8KB9z+8quniSEPGlO0g/v0kvuIh94zwJflfFepBPagF41WLiuETD/NRgQL/BbrKGAKi7Ohk1BA=="/>
         </item>
     </channel>
 </rss>
