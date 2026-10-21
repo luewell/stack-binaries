@@ -8,7 +8,7 @@
 # already pins, then take the digest it prints into that entry.
 name: PHP for Windows
 
-run-name: PHP ${{ inputs.version }} for Windows
+run-name: PHP ${{ inputs.version }}${{ inputs.patch && format(' with php-src {0}', inputs.patch) || '' }} for Windows
 
 on:
   workflow_dispatch:
@@ -16,6 +16,11 @@ on:
       version:
         description: PHP release to build, like 8.4.25
         required: true
+      # As in php.yml: released as php-<version>-<commit>-windows.
+      patch:
+        description: php-src commit, 10 hex digits, whose patches/php-src-<commit>.patch to apply
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -46,10 +51,15 @@ jobs:
       - name: Refuse a version that is not a release number
         env:
           VERSION: ${{ inputs.version }}
+          PATCH: ${{ inputs.patch }}
         run: |
           set -euo pipefail
           if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "the version must be a release like 8.4.25" >&2
+            exit 1
+          fi
+          if [[ -n "$PATCH" && ! "$PATCH" =~ ^[0-9a-f]{10}$ ]]; then
+            echo "the patch must be a php-src commit of 10 hex digits" >&2
             exit 1
           fi
 
@@ -65,7 +75,7 @@ jobs:
             downloads
             buildroot
             source
-          key: spc-${{ env.SPC_VERSION }}-php-${{ inputs.version }}-windows-x86_64-${{ hashFiles('craft.yml', 'php-windows-intl.php') }}
+          key: spc-${{ env.SPC_VERSION }}-php-${{ inputs.version }}${{ inputs.patch && format('-{0}', inputs.patch) || '' }}-windows-x86_64-${{ hashFiles('craft.yml', 'php-windows-intl.php', 'php-src-patch.php') }}
 
       - name: Fetch static-php-cli, and refuse it if it is not what we pinned
         run: |
@@ -89,6 +99,7 @@ jobs:
       - name: Derive the Windows craft from craft.yml
         env:
           VERSION: ${{ inputs.version }}
+          PATCH: ${{ inputs.patch }}
         run: |
           set -euo pipefail
           sed -e "s/^php-version: .*/php-version: \"${VERSION}\"/" \
@@ -99,6 +110,14 @@ jobs:
               craft.yml > craft-windows.yml
 
           printf 'build-options:\n  with-added-patch:\n    - php-windows-intl.php\n' >> craft-windows.yml
+          if [ -n "$PATCH" ]; then
+            if [ ! -f "patches/php-src-${PATCH}.patch" ]; then
+              echo "patches/php-src-${PATCH}.patch is not in this repository" >&2
+              exit 1
+            fi
+            printf '    - php-src-patch.php\n' >> craft-windows.yml
+            patch --version | head -1
+          fi
 
           if grep -qE '^  - (fpm|gmp|pcntl|posix)$' craft-windows.yml || ! grep -qx '  - cgi' craft-windows.yml; then
             echo "craft.yml no longer has the shape this step rewrites:" >&2
@@ -115,6 +134,7 @@ jobs:
           # spc asks api.github.com which version of each library to take; the
           # token is read-only and only reads public metadata here.
           GITHUB_TOKEN: ${{ github.token }}
+          PHP_SRC_PATCH: ${{ inputs.patch && format('{0}\patches\php-src-{1}.patch', github.workspace, inputs.patch) || '' }}
         run: |
           $env:PATH = "$env:SystemRoot\System32;$env:PATH"
           .\spc.exe craft craft-windows.yml
@@ -138,7 +158,7 @@ jobs:
             downloads
             buildroot
             source
-          key: spc-${{ env.SPC_VERSION }}-php-${{ inputs.version }}-windows-x86_64-${{ hashFiles('craft.yml', 'php-windows-intl.php') }}
+          key: spc-${{ env.SPC_VERSION }}-php-${{ inputs.version }}${{ inputs.patch && format('-{0}', inputs.patch) || '' }}-windows-x86_64-${{ hashFiles('craft.yml', 'php-windows-intl.php', 'php-src-patch.php') }}
 
       # spc links pgsql and pdo_pgsql against the libpq.dll of EnterpriseDB's
       # PostgreSQL binaries, which it builds against; that DLL and what it
@@ -320,14 +340,21 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}
+          PATCH: ${{ inputs.patch }}
         run: |
           set -euo pipefail
           archive="php-${VERSION}-windows-x86_64.zip"
           digest="$(sha256sum "$archive" | awk '{print $1}')"
-          gh release create "php-${VERSION}-windows" \
+          title="PHP ${VERSION} for Windows"
+          patched=""
+          if [ -n "$PATCH" ]; then
+            title="PHP ${VERSION} with php-src ${PATCH} for Windows"
+            patched=" With php-src commit https://github.com/php/php-src/commit/${PATCH} applied, from patches/php-src-${PATCH}.patch."
+          fi
+          gh release create "php-${VERSION}${PATCH:+-${PATCH}}-windows" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "PHP ${VERSION} for Windows" \
-            --notes "Built with static-php-cli ${SPC_VERSION} on Windows x64, with the extensions of the other platforms' builds but pcntl and posix, which exist only on Unix, and gmp, whose library static-php-cli does not build for Windows. php-cgi.exe serves FastCGI, since Windows has no php-fpm.
+            --title "$title" \
+            --notes "Built with static-php-cli ${SPC_VERSION} on Windows x64, with the extensions of the other platforms' builds but pcntl and posix, which exist only on Unix, and gmp, whose library static-php-cli does not build for Windows. php-cgi.exe serves FastCGI, since Windows has no php-fpm.${patched}
 
           SHA-256: \`${digest}\`" \
             "$archive"

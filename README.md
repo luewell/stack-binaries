@@ -45,6 +45,13 @@ binary that would only work where it was built: a library path naming the build
 machine means the binary can be installed in one directory for ever, which is
 how DBngin ends up pinned to `/Users/Shared/DBngin`.
 
+Both PHP workflows take an optional php-src commit, for a fix upstream published
+only as source, for a line it no longer releases. `php-src-patch.php` applies
+`patches/php-src-<commit>.patch`, taken unchanged from php-src, and the build is
+released as `php-<version>-<commit>` (and `-windows`), beside the unpatched one.
+PHP 8.1.34 carries `1d7dec178a`, php-src's mitigation of CVE-2026-109618 and
+CVE-2026-109619 for 8.1, which also turns off session upload progress.
+
 ## Stack's own releases
 
 `scripts/publish.sh` in the stack repository publishes them, with the

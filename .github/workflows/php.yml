@@ -7,7 +7,7 @@ name: PHP
 
 # Without this every run is listed as "PHP #7" and three versions building at
 # once are told apart only by opening them.
-run-name: PHP ${{ inputs.version }}
+run-name: PHP ${{ inputs.version }}${{ inputs.patch && format(' with php-src {0}', inputs.patch) || '' }}
 
 on:
   workflow_dispatch:
@@ -16,6 +16,13 @@ on:
         description: PHP version to build, as a line like 8.4 or a release like 8.4.25
         required: true
         default: "8.4"
+      # For a fix upstream published only as source, for a line it no longer
+      # releases. The release is tagged php-<version>-<commit>, beside the
+      # unpatched one, which a published catalogue may still pin.
+      patch:
+        description: php-src commit, 10 hex digits, whose patches/php-src-<commit>.patch to apply
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -44,8 +51,14 @@ jobs:
         id: resolve
         env:
           ASKED: ${{ inputs.version }}
+          PATCH: ${{ inputs.patch }}
         run: |
           set -euo pipefail
+          if [[ -n "$PATCH" && ! "$PATCH" =~ ^[0-9a-f]{10}$ ]]; then
+            echo "the patch must be a php-src commit of 10 hex digits" >&2
+            exit 1
+          fi
+
           if [[ ! "$ASKED" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
             echo "the version must be a line like 8.4 or a release like 8.4.25" >&2
             exit 1
@@ -67,7 +80,7 @@ jobs:
               ;;
           esac
 
-          echo "tag=php-${resolved}" >> "$GITHUB_OUTPUT"
+          echo "tag=php-${resolved}${PATCH:+-${PATCH}}" >> "$GITHUB_OUTPUT"
           echo "version=${resolved}" >> "$GITHUB_OUTPUT"
           echo "${ASKED} is ${resolved}"
 
@@ -114,7 +127,7 @@ jobs:
             downloads
             buildroot
             source
-          key: spc-${{ env.SPC_VERSION }}-php-${{ inputs.version }}-${{ matrix.platform }}-${{ hashFiles('craft.yml') }}
+          key: spc-${{ env.SPC_VERSION }}-php-${{ inputs.version }}${{ inputs.patch && format('-{0}', inputs.patch) || '' }}-${{ matrix.platform }}-${{ hashFiles('craft.yml', 'php-src-patch.php') }}
 
       - name: Fetch static-php-cli, and refuse it if it is not what we pinned
         run: |
@@ -149,6 +162,7 @@ jobs:
       - name: Point craft.yml at the version prepare resolved
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
+          PATCH: ${{ inputs.patch }}
         run: |
           set -euo pipefail
           if [ "$RUNNER_OS" = macOS ]; then
@@ -157,6 +171,15 @@ jobs:
             sed -i "s/^php-version: .*/php-version: \"${VERSION}\"/" craft.yml
           fi
 
+          if [ -n "$PATCH" ]; then
+            if [ ! -f "patches/php-src-${PATCH}.patch" ]; then
+              echo "patches/php-src-${PATCH}.patch is not in this repository" >&2
+              exit 1
+            fi
+            printf 'build-options:\n  with-added-patch:\n    - php-src-patch.php\n' >> craft.yml
+          fi
+          cat craft.yml
+
       - name: Build
         env:
           # spc asks api.github.com which version of each library to take, and
@@ -164,6 +187,7 @@ jobs:
           # allowance is gone. The token is read-only and only reads public
           # metadata here.
           GITHUB_TOKEN: ${{ github.token }}
+          PHP_SRC_PATCH: ${{ inputs.patch && format('{0}/patches/php-src-{1}.patch', github.workspace, inputs.patch) || '' }}
         run: |
           set -euo pipefail
           ./spc craft craft.yml
@@ -335,6 +359,7 @@ jobs:
     env:
       TAG: ${{ needs.prepare.outputs.tag }}
       VERSION: ${{ needs.prepare.outputs.version }}
+      PATCH: ${{ inputs.patch }}
     steps:
       - name: Take the archives the builds produced
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -360,10 +385,16 @@ jobs:
             echo "${TAG} is already there"
             exit 0
           fi
+          title="PHP ${VERSION}"
+          patched=""
+          if [ -n "$PATCH" ]; then
+            title="PHP ${VERSION} with php-src ${PATCH}"
+            patched=" With php-src commit https://github.com/php/php-src/commit/${PATCH} applied, from patches/php-src-${PATCH}.patch."
+          fi
           gh release create "$TAG" --draft \
             --repo "$GITHUB_REPOSITORY" \
-            --title "PHP ${VERSION}" \
-            --notes "Built with static-php-cli ${SPC_VERSION}, because upstream publishes no build carrying the database drivers.
+            --title "$title" \
+            --notes "Built with static-php-cli ${SPC_VERSION}, because upstream publishes no build carrying the database drivers.${patched}
 
           Each asset's SHA-256 is in the job that produced it."
 

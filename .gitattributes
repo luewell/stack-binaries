@@ -1,0 +1,3 @@
+# Applied byte for byte to sources with LF endings, including on Windows runners,
+# whose checkout would otherwise convert them to CRLF.
+patches/*.patch -text
