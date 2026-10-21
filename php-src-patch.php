@@ -13,10 +13,11 @@ if ($patch === false || !is_file($patch)) {
 }
 
 $source = SOURCE_PATH . '/php-src';
+$program = getenv('PHP_SRC_PATCH_PROGRAM') ?: 'patch';
 
-$applies = function (array $options) use ($patch, $source): bool {
+$applies = function (array $options) use ($program, $patch, $source): bool {
     $process = proc_open(
-        ['patch', '-p1', '--batch', '--forward', ...$options],
+        [$program, '-p1', '--batch', '--forward', ...$options],
         [0 => ['file', $patch, 'r'], 1 => STDOUT, 2 => STDERR],
         $pipes,
         $source,

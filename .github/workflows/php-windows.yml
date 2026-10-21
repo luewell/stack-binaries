@@ -116,7 +116,13 @@ jobs:
               exit 1
             fi
             printf '    - php-src-patch.php\n' >> craft-windows.yml
+
+            # Named, not found on PATH: the build's PATH reaches Strawberry
+            # Perl's patch 2.5.9 first, which asserts on this kind of patch, and
+            # putting Git's usr/bin ahead would shadow MSVC's link.exe.
+            program="$(cygpath -w "$(command -v patch)")"
             patch --version | head -1
+            echo "PHP_SRC_PATCH_PROGRAM=${program}" >> "$GITHUB_ENV"
           fi
 
           if grep -qE '^  - (fpm|gmp|pcntl|posix)$' craft-windows.yml || ! grep -qx '  - cgi' craft-windows.yml; then
