@@ -312,14 +312,17 @@ jobs:
           name: postgresql-${{ matrix.triple }}
           path: archive
 
+      # A relative directory, because Git for Windows' tar reads the drive
+      # letter in $RUNNER_TEMP as a remote host.
       - name: Check it initialises and creates pg_partman
         env:
           VERSION: ${{ inputs.version }}
           TRIPLE: ${{ matrix.triple }}
         run: |
           set -euo pipefail
-          tar -xzf "archive/postgresql-${VERSION}-${TRIPLE}.tar.gz" -C "$RUNNER_TEMP"
-          sh postgresql-probe.sh "$RUNNER_TEMP/postgresql-${VERSION}-${TRIPLE}" "$RUNNER_TEMP/data" "$PG_PARTMAN_VERSION"
+          mkdir probe
+          tar -xzf "archive/postgresql-${VERSION}-${TRIPLE}.tar.gz" -C probe
+          sh postgresql-probe.sh "$(pwd)/probe/postgresql-${VERSION}-${TRIPLE}" "$(pwd)/probe/data" "$PG_PARTMAN_VERSION"
 
   # The only job that can write to this repository. The builds run libxml2's
   # configure and make and pg_partman's make, so this one checks nothing out
