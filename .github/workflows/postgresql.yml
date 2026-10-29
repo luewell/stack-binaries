@@ -1,0 +1,365 @@
+# Repackages the upstream PostgreSQL builds with pg_partman, and on Linux with
+# the libxml2 they link.
+#
+# theseus-rs/postgresql-binaries ships PostgreSQL and its contrib modules only.
+# This adds pg_partman without its background worker, which leaves SQL files
+# alone, the same on every platform, so nothing is compiled for macOS or
+# Windows. Its control file needs no superuser, so a role owning its database
+# creates the extension itself.
+#
+# theseus-rs builds Linux on Debian 12 and links the system's libxml2.so.2,
+# which Ubuntu 26.04 no longer ships: it moved to libxml2.so.16, whose ABI
+# differs. Every binary looks in $ORIGIN/../lib first, so the Linux archives
+# also carry a libxml2.so.2 built from libxml2's own release.
+#
+# Run it for a version listed in postgresql-upstream.json, then take the
+# digests it prints into the catalogue entry.
+name: PostgreSQL
+
+run-name: PostgreSQL ${{ inputs.version }} with pg_partman
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: PostgreSQL release to repackage, such as 18.6.0
+        required: true
+        default: "18.6.0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  # The last libxml2 series with the libxml2.so.2 soname, pinned to the sha256
+  # download.gnome.org publishes beside the release.
+  LIBXML2_VERSION: "2.13.9"
+  LIBXML2_SHA256: "a2c9ae7b770da34860050c309f903221c67830c86e4a7e760692b803df95143a"
+  # pg_partman publishes no release assets; this is the sha256 of GitHub's
+  # archive of the tag.
+  PG_PARTMAN_VERSION: "5.5.0"
+  PG_PARTMAN_SHA256: "a3f100ae871677f0012579f58542c174900297f664a4ad2be0256e7ee5e33502"
+
+jobs:
+  # pg_partman's Makefile builds its install script by joining its sources, so
+  # it runs once, against one upstream build's PGXS, and every archive takes
+  # the files it installed.
+  extension:
+    runs-on: ubuntu-24.04
+    container: debian:12
+    timeout-minutes: 15
+    steps:
+      - name: Refuse a version that is not a release number
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -eu
+          if ! printf '%s\n' "$VERSION" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "the version must be a release like 18.6.0" >&2
+            exit 1
+          fi
+
+      # pg_config runs with the libraries the upstream binaries link.
+      - name: Install the build dependencies
+        run: |
+          set -eu
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            ca-certificates curl jq make \
+            libssl3 libgssapi-krb5-2 libzstd1 liblz4-1 libxxhash0 zlib1g libkeyutils1 libreadline8
+
+      # Pinned to a commit rather than a tag. A tag moves, and official is a
+      # much smaller risk than a third party's, not no risk.
+      - name: Check out this repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      # The digests come from this repository, reviewed, not from where the
+      # archives are downloaded from.
+      - name: Download the upstream build and pg_partman
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -eu
+          triple=x86_64-unknown-linux-gnu
+          expected="$(jq -r --arg version "$VERSION" --arg triple "$triple" '.[$version][$triple] // empty' postgresql-upstream.json)"
+          if [ -z "$expected" ]; then
+            echo "postgresql-upstream.json pins no ${triple} build of ${VERSION}" >&2
+            exit 1
+          fi
+          curl -fsSL --proto '=https' --proto-redir '=https' -o upstream.tar.gz \
+            "https://github.com/theseus-rs/postgresql-binaries/releases/download/${VERSION}/postgresql-${VERSION}-${triple}.tar.gz"
+          printf '%s  upstream.tar.gz\n' "$expected" | sha256sum --check --strict
+
+          curl -fsSL --proto '=https' --proto-redir '=https' -o pg_partman.tar.gz \
+            "https://github.com/pgpartman/pg_partman/archive/refs/tags/v${PG_PARTMAN_VERSION}.tar.gz"
+          printf '%s  pg_partman.tar.gz\n' "$PG_PARTMAN_SHA256" | sha256sum --check --strict
+
+      # NO_BGW leaves out the background worker, the only compiled part.
+      # SCRIPTS and DOCS leave out its optional Python helpers and Markdown.
+      - name: Install pg_partman's files
+        run: |
+          set -eu
+          mkdir postgresql pg_partman-source
+          tar -xzf upstream.tar.gz -C postgresql --strip-components 1
+          tar -xzf pg_partman.tar.gz -C pg_partman-source --strip-components 1
+          make -C pg_partman-source install NO_BGW=1 SCRIPTS= DOCS= \
+            PG_CONFIG="$(pwd)/postgresql/bin/pg_config"
+
+          mkdir -p extension/share/extension extension/share/licenses/pg_partman
+          cp postgresql/share/extension/pg_partman.control postgresql/share/extension/pg_partman--*.sql \
+            extension/share/extension/
+          cp pg_partman-source/LICENSE.txt extension/share/licenses/pg_partman/LICENSE.txt
+
+          if [ ! -f "extension/share/extension/pg_partman--${PG_PARTMAN_VERSION}.sql" ]; then
+            echo "pg_partman installed no script for ${PG_PARTMAN_VERSION}" >&2
+            exit 1
+          fi
+          if find postgresql/lib -name 'pg_partman*' | grep -q .; then
+            echo "pg_partman installed a library; only its SQL files are expected" >&2
+            exit 1
+          fi
+
+      - name: Hand the files to the packaging jobs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pg_partman
+          path: extension
+          if-no-files-found: error
+
+  package:
+    needs: extension
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - triple: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            linux: true
+          - triple: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            linux: true
+          - triple: aarch64-apple-darwin
+            runner: ubuntu-24.04
+            linux: false
+          - triple: x86_64-pc-windows-msvc
+            runner: ubuntu-24.04
+            linux: false
+    runs-on: ${{ matrix.runner }}
+    # The glibc upstream built against, so the library asks for nothing newer
+    # than the binaries beside it; GNU tar packs every platform's archive.
+    container: debian:12
+    timeout-minutes: 30
+    steps:
+      - name: Install the build and runtime dependencies
+        run: |
+          set -eu
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            build-essential ca-certificates curl jq xz-utils \
+            libssl3 libgssapi-krb5-2 libzstd1 liblz4-1 libxxhash0 zlib1g libkeyutils1 libreadline8
+
+      - name: Check out this repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Download the upstream build
+        env:
+          VERSION: ${{ inputs.version }}
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          set -eu
+          expected="$(jq -r --arg version "$VERSION" --arg triple "$TRIPLE" '.[$version][$triple] // empty' postgresql-upstream.json)"
+          if [ -z "$expected" ]; then
+            echo "postgresql-upstream.json pins no ${TRIPLE} build of ${VERSION}" >&2
+            exit 1
+          fi
+          curl -fsSL --proto '=https' --proto-redir '=https' -o upstream.tar.gz \
+            "https://github.com/theseus-rs/postgresql-binaries/releases/download/${VERSION}/postgresql-${VERSION}-${TRIPLE}.tar.gz"
+          printf '%s  upstream.tar.gz\n' "$expected" | sha256sum --check --strict
+
+      - name: Take pg_partman's files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pg_partman
+          path: extension
+
+      - name: Build libxml2
+        if: matrix.linux
+        run: |
+          set -eu
+          curl -fsSL --proto '=https' --proto-redir '=https' -o libxml2.tar.xz \
+            "https://download.gnome.org/sources/libxml2/${LIBXML2_VERSION%.*}/libxml2-${LIBXML2_VERSION}.tar.xz"
+          printf '%s  libxml2.tar.xz\n' "$LIBXML2_SHA256" | sha256sum --check --strict
+          tar -xf libxml2.tar.xz
+          cd "libxml2-${LIBXML2_VERSION}"
+          # Only what PostgreSQL's xml type calls: no network, no Python, no
+          # ICU or lzma, which would each be one more library to carry.
+          ./configure --prefix="$RUNNER_TEMP/libxml2" --disable-static \
+            --without-python --without-icu --without-lzma --without-zlib \
+            --without-readline --without-http --without-ftp --without-modules
+          make -j"$(nproc)"
+          make install
+
+      - name: Assemble the tree
+        id: assemble
+        env:
+          VERSION: ${{ inputs.version }}
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          set -eu
+          root="postgresql-${VERSION}-${TRIPLE}"
+          mkdir -p "$root"
+          tar -xzf upstream.tar.gz -C "$root" --strip-components 1
+          for file in extension/share/extension/*; do
+            if [ -e "$root/share/extension/$(basename "$file")" ]; then
+              echo "the upstream build already has $(basename "$file")" >&2
+              exit 1
+            fi
+          done
+          cp -R extension/share/. "$root/share/"
+          echo "root=${root}" >> "$GITHUB_OUTPUT"
+
+      - name: Put libxml2 beside the binaries
+        if: matrix.linux
+        env:
+          ROOT: ${{ steps.assemble.outputs.root }}
+        run: |
+          set -eu
+          strip -o "$ROOT/lib/libxml2.so.2" "$RUNNER_TEMP/libxml2/lib/libxml2.so.${LIBXML2_VERSION}"
+          mkdir -p "$ROOT/share/licenses/libxml2"
+          cp "libxml2-${LIBXML2_VERSION}/Copyright" "$ROOT/share/licenses/libxml2/Copyright"
+
+          resolved="$(ldd "$ROOT/bin/postgres" | awk '$1 == "libxml2.so.2" {print $3}')"
+          if [ "$resolved" != "$(pwd)/$ROOT/bin/../lib/libxml2.so.2" ]; then
+            echo "postgres finds libxml2.so.2 at ${resolved:-nowhere}, not beside it" >&2
+            exit 1
+          fi
+
+      # The same bytes for the same inputs, so a second run can be checked
+      # against the first.
+      - name: Pack
+        id: package
+        env:
+          ROOT: ${{ steps.assemble.outputs.root }}
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          set -eu
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+            --mtime='2000-01-01 00:00:00 UTC' -cf - "$ROOT" | gzip -n -9 > "${ROOT}.tar.gz"
+          echo "archive=${ROOT}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "SHA-256 for the catalogue entry (${TRIPLE}): $(sha256sum "${ROOT}.tar.gz" | awk '{print $1}')"
+
+      # initdb refuses to run as root.
+      - name: Check it initialises, parses XML and creates pg_partman
+        if: matrix.linux
+        env:
+          ROOT: ${{ steps.assemble.outputs.root }}
+        run: |
+          set -eu
+          useradd --create-home probe
+          chown -R probe "$ROOT"
+          cp postgresql-probe.sh /home/probe/
+          su probe -c "sh /home/probe/postgresql-probe.sh '$(pwd)/$ROOT' /home/probe/data '$PG_PARTMAN_VERSION'"
+          su probe -c "
+            set -eu
+            '$ROOT/bin/initdb' -D /home/probe/xml -U probe --auth=trust --encoding=UTF8 --no-sync >/dev/null
+            '$ROOT/bin/pg_ctl' -D /home/probe/xml -o '-p 55433 -k /tmp -c listen_addresses=' -l /home/probe/xml.log -w start >/dev/null
+            answer=\$('$ROOT/bin/psql' -h /tmp -p 55433 -U probe -d postgres -tAc \"SELECT (xpath('/a/text()', '<a>ok</a>'::xml))[1]::text\")
+            '$ROOT/bin/pg_ctl' -D /home/probe/xml -w stop >/dev/null
+            [ \"\$answer\" = ok ]
+          "
+
+      - name: Hand the archive to the release job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: postgresql-${{ matrix.triple }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+
+  # macOS and Windows archives are packed on Linux, so they run on their own
+  # platform before they are released.
+  verify:
+    needs: package
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - triple: aarch64-apple-darwin
+            # macos-14 and later are Apple silicon.
+            runner: macos-14
+          - triple: x86_64-pc-windows-msvc
+            runner: windows-2025
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Take the archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: postgresql-${{ matrix.triple }}
+          path: archive
+
+      - name: Check it initialises and creates pg_partman
+        env:
+          VERSION: ${{ inputs.version }}
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          set -euo pipefail
+          tar -xzf "archive/postgresql-${VERSION}-${TRIPLE}.tar.gz" -C "$RUNNER_TEMP"
+          sh postgresql-probe.sh "$RUNNER_TEMP/postgresql-${VERSION}-${TRIPLE}" "$RUNNER_TEMP/data" "$PG_PARTMAN_VERSION"
+
+  # The only job that can write to this repository. The builds run libxml2's
+  # configure and make and pg_partman's make, so this one checks nothing out
+  # and runs nothing they produced; it only moves their archives into the
+  # release.
+  release:
+    needs: [package, verify]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Take the archives the builds produced
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: postgresql-*
+          path: archives
+          merge-multiple: true
+
+      # The names and digests are worked out here from the validated version and
+      # the files themselves, not taken from the builds, whose outputs their code
+      # wrote. Every platform or none: a release the catalogue could pin part
+      # of would leave the rest a missing URL.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          archives=()
+          notes="Upstream theseus-rs/postgresql-binaries ${VERSION} with pg_partman ${PG_PARTMAN_VERSION} (SQL only, no background worker) in share/extension, and on Linux libxml2 ${LIBXML2_VERSION} in lib/, because Ubuntu 26.04 no longer ships libxml2.so.2."
+          for triple in aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-msvc; do
+            archive="archives/postgresql-${VERSION}-${triple}.tar.gz"
+            [ -f "$archive" ] || { echo "the ${triple} archive is missing" >&2; exit 1; }
+            archives+=("$archive")
+            notes="${notes}
+
+          ${triple}: \`$(sha256sum "$archive" | awk '{print $1}')\`"
+          done
+          gh release create "postgresql-${VERSION}-pg_partman-${PG_PARTMAN_VERSION}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "PostgreSQL ${VERSION} with pg_partman ${PG_PARTMAN_VERSION}" \
+            --notes "$notes" \
+            "${archives[@]}"
