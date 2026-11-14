@@ -1,0 +1,405 @@
+# Builds memcached, with libevent compiled in, because upstream publishes only
+# source.
+#
+# libevent is built static and without OpenSSL, and memcached without TLS or
+# SASL, so bin/memcached loads nothing outside the base system and runs from
+# any directory.
+#
+# Run it for a version with the sha256 of memcached-<version>.tar.gz, which
+# memcached.org does not publish: download the tarball, check it against the
+# SHA-1 on https://memcached.org/downloads, and take its sha256. The build
+# checks the same SHA-1 again. Then take the digests it prints into the
+# catalogue entry.
+name: Memcached
+
+run-name: Memcached ${{ inputs.version }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: memcached release to build, such as 1.6.45
+        required: true
+        default: "1.6.45"
+      sha256:
+        description: sha256 of memcached-<version>.tar.gz
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  # The sha256 GitHub publishes for the release asset.
+  LIBEVENT_VERSION: "2.1.13-stable"
+  LIBEVENT_SHA256: "f7e9383b8c0baa81b687e5b5eecc01beefaf1b19b64151d95ed61647fe7a315c"
+  # Nick Mathewson, libevent's author, who signed 2.1.13 with a subkey of this
+  # key; the fingerprint is the one Tor's README lists for him.
+  # openpgp-check.sh accepts a signature only under this primary key, whatever
+  # the keyserver returns.
+  LIBEVENT_SIGNING_KEY: "2133BC600AB133E1D826D173FE43009C4607B1FB"
+
+jobs:
+  # Everything is downloaded and checked once, here, where gpg is at hand, and
+  # the builds take the files from this job rather than from the network.
+  download:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Refuse a malformed version or digest
+        env:
+          VERSION: ${{ inputs.version }}
+          SHA256: ${{ inputs.sha256 }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$VERSION" =~ ^1\.[0-9]+\.[0-9]+$ ]]; then
+            echo "the version must be a release like 1.6.45" >&2
+            exit 1
+          fi
+          if [[ ! "$SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "the sha256 must be 64 lower-case hex digits" >&2
+            exit 1
+          fi
+
+      # Pinned to a commit rather than a tag. A tag moves, and official is a
+      # much smaller risk than a third party's, not no risk.
+      - name: Check out this repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Download memcached and check it against both digests
+        env:
+          VERSION: ${{ inputs.version }}
+          SHA256: ${{ inputs.sha256 }}
+        run: |
+          set -euo pipefail
+          mkdir -p source
+          archive="source/memcached-${VERSION}.tar.gz"
+          curl -fsSL --proto '=https' --proto-redir '=https' -o "$archive" \
+            "https://memcached.org/files/memcached-${VERSION}.tar.gz"
+          published_sha1="$(curl -fsSL --proto '=https' --proto-redir '=https' \
+            "https://memcached.org/files/memcached-${VERSION}.tar.gz.sha1" | awk '{print $1}')"
+          if [[ ! "$published_sha1" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "memcached.org publishes no SHA-1 for ${VERSION}" >&2
+            exit 1
+          fi
+          printf '%s  %s\n' "$published_sha1" "$archive" | sha1sum --check --strict
+          printf '%s  %s\n' "$SHA256" "$archive" | sha256sum --check --strict
+
+      - name: Download libevent and check its digest and signature
+        run: |
+          set -euo pipefail
+          archive="source/libevent-${LIBEVENT_VERSION}.tar.gz"
+          base="https://github.com/libevent/libevent/releases/download/release-${LIBEVENT_VERSION}"
+          curl -fsSL --proto '=https' --proto-redir '=https' -o "$archive" "${base}/libevent-${LIBEVENT_VERSION}.tar.gz"
+          curl -fsSL --proto '=https' --proto-redir '=https' -o libevent.tar.gz.asc "${base}/libevent-${LIBEVENT_VERSION}.tar.gz.asc"
+          printf '%s  %s\n' "$LIBEVENT_SHA256" "$archive" | sha256sum --check --strict
+          bash openpgp-check.sh "$LIBEVENT_SIGNING_KEY" libevent.tar.gz.asc "$archive"
+
+      - name: Hand the sources to the builds
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: memcached-source
+          path: source
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  build-macos:
+    needs: download
+    # macos-14 and later are Apple silicon. This project supports no Intel Macs.
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Take the verified sources
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: memcached-source
+          path: source
+
+      # Only the static library is installed, so memcached cannot link the
+      # runner's Homebrew libevent instead.
+      - name: Build libevent
+        run: |
+          set -euo pipefail
+          mkdir libevent-source
+          tar -xzf "source/libevent-${LIBEVENT_VERSION}.tar.gz" -C libevent-source --strip-components 1
+          cd libevent-source
+          ./configure --prefix="$RUNNER_TEMP/libevent" --disable-shared --enable-static \
+            --disable-openssl --disable-samples --disable-libevent-regress
+          make -j"$(sysctl -n hw.ncpu)"
+          make install
+
+      # --with-libevent also records the libevent directory as a run path,
+      # which a static library has no use for and which names the runner.
+      - name: Build memcached
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir memcached-source
+          tar -xzf "source/memcached-${VERSION}.tar.gz" -C memcached-source --strip-components 1
+          cd memcached-source
+          ./configure --with-libevent="$RUNNER_TEMP/libevent" --disable-sasl --disable-tls --disable-docs
+          make -j"$(sysctl -n hw.ncpu)" memcached
+          run_paths="$(otool -l memcached | awk '$1 == "cmd" { in_rpath = ($2 == "LC_RPATH") } in_rpath && $1 == "path" { print $2 }')"
+          while IFS= read -r run_path; do
+            [ -n "$run_path" ] || continue
+            install_name_tool -delete_rpath "$run_path" memcached
+          done <<< "$run_paths"
+
+      # -x keeps global symbols. An arm64 binary without at least an ad-hoc
+      # signature is killed by the kernel, and stripping drops the one the
+      # linker made.
+      - name: Assemble, strip and sign
+        id: assemble
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          root="memcached-${VERSION}-aarch64-apple-darwin"
+          mkdir -p "$root/bin" "$root/share/licenses/memcached" "$root/share/licenses/libevent"
+          cp memcached-source/memcached "$root/bin/"
+          cp memcached-source/COPYING memcached-source/LICENSE.bipbuffer "$root/share/licenses/memcached/"
+          cp libevent-source/LICENSE "$root/share/licenses/libevent/"
+          strip -S -x "$root/bin/memcached"
+          codesign --force --sign - "$root/bin/memcached"
+          echo "root=${root}" >> "$GITHUB_OUTPUT"
+
+      # Without the two flags bsdtar adds an AppleDouble ._ entry for every file
+      # carrying an extended attribute.
+      - name: Pack
+        id: package
+        env:
+          ROOT: ${{ steps.assemble.outputs.root }}
+        run: |
+          set -euo pipefail
+          COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -czf "${ROOT}.tar.gz" "$ROOT"
+          echo "archive=${ROOT}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "SHA-256 for the catalogue entry (aarch64-apple-darwin): $(shasum -a 256 "${ROOT}.tar.gz" | awk '{print $1}')"
+
+      - name: Check it runs from another directory without where it was built
+        env:
+          VERSION: ${{ inputs.version }}
+          ROOT: ${{ steps.assemble.outputs.root }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/extracted"
+          tar -xzf "$ARCHIVE" -C "$RUNNER_TEMP/extracted"
+          rm -rf "$ROOT" "$RUNNER_TEMP/libevent" memcached-source libevent-source
+          bash relocatable-check.sh "$RUNNER_TEMP/extracted/$ROOT"
+          bash memcached-probe.sh "$RUNNER_TEMP/extracted/$ROOT" "$VERSION"
+
+      - name: Hand the archive to the release job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: memcached-archive-aarch64-apple-darwin
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+          compression-level: 0
+
+  build-linux:
+    needs: download
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - triple: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - triple: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    # The oldest distribution supported, so the build asks for no newer glibc
+    # than it has.
+    container: ubuntu:22.04
+    timeout-minutes: 30
+    steps:
+      - name: Install the build tools
+        run: |
+          set -eu
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            build-essential patchelf
+
+      - name: Check out this repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Take the verified sources
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: memcached-source
+          path: source
+
+      - name: Build libevent
+        run: |
+          set -eu
+          mkdir libevent-source
+          tar -xzf "source/libevent-${LIBEVENT_VERSION}.tar.gz" -C libevent-source --strip-components 1
+          cd libevent-source
+          ./configure --prefix="$RUNNER_TEMP/libevent" --disable-shared --enable-static \
+            --disable-openssl --disable-samples --disable-libevent-regress
+          make -j"$(nproc)"
+          make install
+
+      # --with-libevent also records the libevent directory as a run path,
+      # which a static library has no use for and which names the runner.
+      - name: Build memcached
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -eu
+          mkdir memcached-source
+          tar -xzf "source/memcached-${VERSION}.tar.gz" -C memcached-source --strip-components 1
+          cd memcached-source
+          ./configure --with-libevent="$RUNNER_TEMP/libevent" --disable-sasl --disable-tls --disable-docs
+          make -j"$(nproc)" memcached
+          patchelf --remove-rpath memcached
+
+      - name: Assemble and strip
+        id: assemble
+        env:
+          VERSION: ${{ inputs.version }}
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          set -eu
+          root="memcached-${VERSION}-${TRIPLE}"
+          mkdir -p "$root/bin" "$root/share/licenses/memcached" "$root/share/licenses/libevent"
+          strip --strip-unneeded -o "$root/bin/memcached" memcached-source/memcached
+          cp memcached-source/COPYING memcached-source/LICENSE.bipbuffer "$root/share/licenses/memcached/"
+          cp libevent-source/LICENSE "$root/share/licenses/libevent/"
+          echo "root=${root}" >> "$GITHUB_OUTPUT"
+
+      # The same bytes for the same inputs, so a second run can be checked
+      # against the first.
+      - name: Pack
+        id: package
+        env:
+          ROOT: ${{ steps.assemble.outputs.root }}
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          set -eu
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+            --mtime='2000-01-01 00:00:00 UTC' -cf - "$ROOT" | gzip -n -9 > "${ROOT}.tar.gz"
+          echo "archive=${ROOT}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "SHA-256 for the catalogue entry (${TRIPLE}): $(sha256sum "${ROOT}.tar.gz" | awk '{print $1}')"
+
+      # The probe runs on clean distributions in the verify job; this one has
+      # the build tools the check reads binaries with.
+      - name: Check it does not depend on where it was built
+        shell: bash
+        env:
+          ROOT: ${{ steps.assemble.outputs.root }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/extracted"
+          tar -xzf "$ARCHIVE" -C "$RUNNER_TEMP/extracted"
+          rm -rf "$ROOT" "$RUNNER_TEMP/libevent" memcached-source libevent-source
+          bash relocatable-check.sh "$RUNNER_TEMP/extracted/$ROOT"
+
+      - name: Hand the archive to the verify and release jobs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: memcached-archive-${{ matrix.triple }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+          compression-level: 0
+
+  # Each Linux archive runs on the oldest and newest distributions supported.
+  verify:
+    needs: build-linux
+    strategy:
+      fail-fast: false
+      matrix:
+        triple: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
+        image: ["ubuntu:22.04", "ubuntu:24.04", "ubuntu:26.04", "debian:12"]
+        include:
+          - triple: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - triple: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.image }}
+    timeout-minutes: 10
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Take the archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: memcached-archive-${{ matrix.triple }}
+          path: archive
+
+      # memcached refuses to run as root without -u.
+      - name: Check it listens and answers
+        env:
+          VERSION: ${{ inputs.version }}
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          set -eu
+          useradd --create-home probe
+          cp memcached-probe.sh "archive/memcached-${VERSION}-${TRIPLE}.tar.gz" /home/probe/
+          chown probe /home/probe/memcached-probe.sh "/home/probe/memcached-${VERSION}-${TRIPLE}.tar.gz"
+          su probe -c "tar -xzf '/home/probe/memcached-${VERSION}-${TRIPLE}.tar.gz' -C /home/probe"
+          su probe -c "bash /home/probe/memcached-probe.sh '/home/probe/memcached-${VERSION}-${TRIPLE}' '${VERSION}'"
+
+  # The only job that can write to this repository. The builds run libevent's
+  # and memcached's configure and make, so this one checks nothing out and runs
+  # nothing they produced; it only moves their archives into the release.
+  release:
+    needs: [build-macos, build-linux, verify]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Take the archives the builds produced
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: memcached-archive-*
+          path: archives
+          merge-multiple: true
+
+      # Published with the CLI the runner already carries, rather than a
+      # third-party action: publishing needs write access to this repository,
+      # and that is not a permission to hand to code we do not control.
+      #
+      # The names and digests are worked out here from the validated version
+      # and the files themselves, not taken from the builds, whose outputs
+      # their code wrote. Every platform or none: a release the catalogue could
+      # pin part of would leave the rest a missing URL.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          archives=()
+          notes="memcached ${VERSION} with libevent ${LIBEVENT_VERSION} compiled in, without TLS or SASL, because upstream publishes only source."
+          for triple in aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            archive="archives/memcached-${VERSION}-${triple}.tar.gz"
+            [ -f "$archive" ] || { echo "the ${triple} archive is missing" >&2; exit 1; }
+            archives+=("$archive")
+            notes="${notes}
+
+          ${triple}: \`$(sha256sum "$archive" | awk '{print $1}')\`"
+          done
+          gh release create "memcached-${VERSION}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Memcached ${VERSION}" \
+            --notes "$notes" \
+            "${archives[@]}"

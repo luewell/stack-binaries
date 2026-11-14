@@ -1,0 +1,458 @@
+# Builds MariaDB from its source release, because upstream publishes no build
+# for macOS and its Linux ones link the system's OpenSSL, libaio and others.
+#
+# mariadb-configure.sh lists what is compiled in and what is left out; the
+# result loads nothing outside the base system and runs from any directory.
+# MariaDB's CMake downloads PCRE2 and fmt while building, checking only an MD5,
+# so this workflow downloads them first against the sha256 pinned below and
+# leaves them where CMake finds them already in place.
+#
+# MariaDB is GPL-2.0, so the release carries the source it was built from with
+# the PCRE2 and fmt archives built into it.
+#
+# Run it for a release on the 11.8 or 12.3 LTS line with the sha256 listed for
+# mariadb-<version>.tar.gz in
+#   https://archive.mariadb.org/mariadb-<version>/source/sha256sums.txt
+# then take the digests it prints into the catalogue entry.
+name: MariaDB
+
+run-name: MariaDB ${{ inputs.version }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: MariaDB release on the 11.8 or 12.3 line, such as 11.8.10
+        required: true
+        default: "11.8.10"
+      sha256:
+        description: sha256 of mariadb-<version>.tar.gz from its sha256sums.txt
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  # Every archive the supported lines' cmake/pcre.cmake and cmake/libfmt.cmake
+  # name, with the sha256 GitHub publishes for the release asset; each one's
+  # MD5 matches the one MariaDB pins beside its URL. A version naming any other
+  # archive stops until it is added here.
+  BUNDLED_SHA256: |
+    40fa9173e167648fb872beaaeab667c8778eb37fabeefffa99a7753edb1a9479  pcre2-10.49.zip
+    40fc58bebcf38c759e11a7bd8fdc163507d2423ef5058bba7f26280c5b9c5465  fmt-11.0.2.zip
+    a2f4a8d51178f954e4c339007f77edd76ba0cb2e36f87a48e5a5403d9be5878f  fmt-12.2.0.zip
+  # Some bundled projects still declare a CMake minimum below the 3.5 that
+  # CMake 4 accepts.
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+
+jobs:
+  # Everything is downloaded and checked once, here, and the builds take the
+  # files from this job rather than from the network.
+  download:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Refuse a malformed version or digest
+        env:
+          VERSION: ${{ inputs.version }}
+          SHA256: ${{ inputs.sha256 }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$VERSION" =~ ^(11\.8|12\.3)\.[0-9]+$ ]]; then
+            echo "the version must be a release on the 11.8 or 12.3 line, like 11.8.10" >&2
+            exit 1
+          fi
+          if [[ ! "$SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "the sha256 must be the 64 lower-case hex digits from sha256sums.txt" >&2
+            exit 1
+          fi
+
+      # The operator's digest and the one beside the tarball must agree, and
+      # the tarball must match both.
+      - name: Download the source and check it
+        env:
+          VERSION: ${{ inputs.version }}
+          SHA256: ${{ inputs.sha256 }}
+        run: |
+          set -euo pipefail
+          mkdir -p source
+          base="https://archive.mariadb.org/mariadb-${VERSION}/source"
+          curl -fsSL --proto '=https' --proto-redir '=https' -o "source/mariadb-${VERSION}.tar.gz" \
+            "${base}/mariadb-${VERSION}.tar.gz"
+          curl -fsSL --proto '=https' --proto-redir '=https' -o sha256sums.txt "${base}/sha256sums.txt"
+
+          listed="$(awk -v name="mariadb-${VERSION}.tar.gz" '$2 == name {print $1}' sha256sums.txt)"
+          if [ "$listed" != "$SHA256" ]; then
+            echo "sha256sums.txt lists ${listed:-nothing} for mariadb-${VERSION}.tar.gz, not ${SHA256}" >&2
+            exit 1
+          fi
+          printf '%s  %s\n' "$SHA256" "source/mariadb-${VERSION}.tar.gz" | sha256sum --check --strict
+
+      - name: Download what MariaDB's CMake would fetch, and check it
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p cmake-files source/bundled
+          tar -xzf "source/mariadb-${VERSION}.tar.gz" -C cmake-files --strip-components 1 \
+            "mariadb-${VERSION}/cmake/pcre.cmake" "mariadb-${VERSION}/cmake/libfmt.cmake"
+
+          urls="$(grep -ohE 'https://[^" ]+\.zip' cmake-files/cmake/pcre.cmake cmake-files/cmake/libfmt.cmake)"
+          if [ -z "$urls" ]; then
+            echo "MariaDB ${VERSION}'s CMake names no archive to download; check how it bundles PCRE2 and fmt" >&2
+            exit 1
+          fi
+          while IFS= read -r url; do
+            name="${url##*/}"
+            expected="$(printf '%s\n' "$BUNDLED_SHA256" | awk -v name="$name" '$2 == name {print $1}')"
+            if [ -z "$expected" ]; then
+              echo "MariaDB ${VERSION} downloads ${url}, which BUNDLED_SHA256 does not pin" >&2
+              exit 1
+            fi
+            curl -fsSL --proto '=https' --proto-redir '=https' -o "source/bundled/${name}" "$url"
+            printf '%s  %s\n' "$expected" "source/bundled/${name}" | sha256sum --check --strict
+          done <<< "$urls"
+
+      # A compressed tarball gains nothing from the artifact's own compression.
+      - name: Hand the sources to the builds and the release job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mariadb-source
+          path: source
+          if-no-files-found: error
+          compression-level: 0
+
+  build-macos:
+    needs: download
+    # macos-14 and later are Apple silicon. This project supports no Intel Macs.
+    runs-on: macos-14
+    # A full server build; GitHub's default ceiling is six hours.
+    timeout-minutes: 150
+    steps:
+      # Pinned to a commit rather than a tag. A tag moves, and official is a
+      # much smaller risk than a third party's, not no risk.
+      - name: Check out this repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Take the verified sources
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: mariadb-source
+          path: source
+
+      # ExternalProject keeps a download whose hash already matches, so PCRE2
+      # and fmt are put where it would save them.
+      #
+      # The runner's Homebrew holds OpenSSL, PCRE2, zstd and more. CMake is
+      # told to ignore its prefixes and pkg-config is given an empty search
+      # path, so nothing from it is found and linked.
+      - name: Configure
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir mariadb-source
+          tar -xzf "source/mariadb-${VERSION}.tar.gz" -C mariadb-source --strip-components 1
+          mkdir -p build/extra/pcre2/src build/extra/libfmt/src
+          cp source/bundled/pcre2-*.zip build/extra/pcre2/src/
+          cp source/bundled/fmt-*.zip build/extra/libfmt/src/
+
+          mkdir "$RUNNER_TEMP/no-pkgconfig"
+          PKG_CONFIG_PATH="" PKG_CONFIG_LIBDIR="$RUNNER_TEMP/no-pkgconfig" \
+            bash mariadb-configure.sh mariadb-source build \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+            "-DCMAKE_IGNORE_PREFIX_PATH=/opt/homebrew;/usr/local" \
+            -DCMAKE_INSTALL_RPATH=@loader_path/../lib
+
+      - name: Build
+        run: cmake --build build --parallel "$(sysctl -n hw.ncpu)"
+
+      # Not --strip: on macOS that strips an executable down to the symbols it
+      # imports, and plugins resolve theirs against mariadbd at load time.
+      - name: Install into a staging directory
+        run: |
+          set -euo pipefail
+          DESTDIR="$(pwd)/stage" cmake --install build
+
+      - name: Assemble the tree
+        id: assemble
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          root="mariadb-${VERSION}-aarch64-apple-darwin"
+          sh mariadb-assemble.sh stage/usr/local/mysql "$root"
+          echo "root=${root}" >> "$GITHUB_OUTPUT"
+
+      # -x drops local symbols only. An arm64 binary without at least an
+      # ad-hoc signature is killed by the kernel, and stripping drops the one
+      # the linker made.
+      - name: Strip and sign every binary
+        env:
+          ROOT: ${{ steps.assemble.outputs.root }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' file; do
+            if [ "$(od -An -tx1 -N4 "$file" | tr -d ' \n')" = cffaedfe ]; then
+              strip -S -x "$file"
+              codesign --force --sign - "$file"
+            fi
+          done < <(find "$ROOT" -type f -print0)
+
+      # Without the two flags bsdtar adds an AppleDouble ._ entry for every file
+      # carrying an extended attribute.
+      - name: Pack
+        id: package
+        env:
+          ROOT: ${{ steps.assemble.outputs.root }}
+        run: |
+          set -euo pipefail
+          COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -czf "${ROOT}.tar.gz" "$ROOT"
+          echo "archive=${ROOT}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "SHA-256 for the catalogue entry (aarch64-apple-darwin): $(shasum -a 256 "${ROOT}.tar.gz" | awk '{print $1}')"
+
+      # The staging and build directories go first, so nothing can be loaded
+      # from where it was built.
+      - name: Check it runs from another directory without where it was built
+        env:
+          VERSION: ${{ inputs.version }}
+          ROOT: ${{ steps.assemble.outputs.root }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/extracted"
+          tar -xzf "$ARCHIVE" -C "$RUNNER_TEMP/extracted"
+          rm -rf "$ROOT" stage build
+          bash relocatable-check.sh "$RUNNER_TEMP/extracted/$ROOT"
+          sh mariadb-probe.sh "$RUNNER_TEMP/extracted/$ROOT" "$(mktemp -d /tmp/mariadb-probe.XXXXXX)" "$VERSION"
+
+      - name: Hand the archive to the release job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mariadb-archive-aarch64-apple-darwin
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+          compression-level: 0
+
+  build-linux:
+    needs: download
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - triple: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - triple: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    # The oldest distribution supported, so the build asks for no newer glibc
+    # or libstdc++ than it has. No libaio, liburing, libnuma or systemd
+    # headers are installed, on top of the configuration not looking for them.
+    container: ubuntu:22.04
+    timeout-minutes: 150
+    steps:
+      - name: Install the build tools
+        run: |
+          set -eu
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            build-essential cmake libncurses-dev
+
+      - name: Check out this repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Take the verified sources
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: mariadb-source
+          path: source
+
+      # ExternalProject keeps a download whose hash already matches, so PCRE2
+      # and fmt are put where it would save them.
+      - name: Configure
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir mariadb-source
+          tar -xzf "source/mariadb-${VERSION}.tar.gz" -C mariadb-source --strip-components 1
+          mkdir -p build/extra/pcre2/src build/extra/libfmt/src
+          cp source/bundled/pcre2-*.zip build/extra/pcre2/src/
+          cp source/bundled/fmt-*.zip build/extra/libfmt/src/
+          bash mariadb-configure.sh mariadb-source build '-DCMAKE_INSTALL_RPATH=$ORIGIN/../lib'
+
+      - name: Build
+        run: cmake --build build --parallel "$(nproc)"
+
+      - name: Install into a staging directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          DESTDIR="$(pwd)/stage" cmake --install build --strip
+
+      - name: Assemble the tree
+        id: assemble
+        env:
+          VERSION: ${{ inputs.version }}
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          set -eu
+          root="mariadb-${VERSION}-${TRIPLE}"
+          sh mariadb-assemble.sh stage/usr/local/mysql "$root"
+          echo "root=${root}" >> "$GITHUB_OUTPUT"
+
+      # The same bytes for the same inputs, so a second run can be checked
+      # against the first.
+      - name: Pack
+        id: package
+        env:
+          ROOT: ${{ steps.assemble.outputs.root }}
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          set -eu
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+            --mtime='2000-01-01 00:00:00 UTC' -cf - "$ROOT" | gzip -n -9 > "${ROOT}.tar.gz"
+          echo "archive=${ROOT}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "SHA-256 for the catalogue entry (${TRIPLE}): $(sha256sum "${ROOT}.tar.gz" | awk '{print $1}')"
+
+      # The probe runs on clean distributions in the verify job; this one has
+      # the build tools the check reads binaries with.
+      - name: Check it does not depend on where it was built
+        shell: bash
+        env:
+          ROOT: ${{ steps.assemble.outputs.root }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/extracted"
+          tar -xzf "$ARCHIVE" -C "$RUNNER_TEMP/extracted"
+          rm -rf "$ROOT" stage build
+          bash relocatable-check.sh "$RUNNER_TEMP/extracted/$ROOT"
+
+      - name: Hand the archive to the verify and release jobs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mariadb-archive-${{ matrix.triple }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+          compression-level: 0
+
+  # Each Linux archive runs on the oldest and newest distributions supported.
+  verify:
+    needs: build-linux
+    strategy:
+      fail-fast: false
+      matrix:
+        triple: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
+        image: ["ubuntu:22.04", "ubuntu:24.04", "ubuntu:26.04", "debian:12"]
+        include:
+          - triple: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - triple: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.image }}
+    timeout-minutes: 15
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Take the archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: mariadb-archive-${{ matrix.triple }}
+          path: archive
+
+      # mariadbd refuses to run as root.
+      - name: Check it installs, serves and shuts down
+        env:
+          VERSION: ${{ inputs.version }}
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          set -eu
+          useradd --create-home probe
+          cp mariadb-probe.sh "archive/mariadb-${VERSION}-${TRIPLE}.tar.gz" /home/probe/
+          chown probe /home/probe/mariadb-probe.sh "/home/probe/mariadb-${VERSION}-${TRIPLE}.tar.gz"
+          su probe -c "tar -xzf '/home/probe/mariadb-${VERSION}-${TRIPLE}.tar.gz' -C /home/probe"
+          su probe -c "sh /home/probe/mariadb-probe.sh '/home/probe/mariadb-${VERSION}-${TRIPLE}' /home/probe/work '${VERSION}'"
+
+  # The only job that can write to this repository. The builds run MariaDB's
+  # CMake and compilers, so this one checks nothing out and runs nothing they
+  # produced; it only moves the archives and sources into the release.
+  release:
+    needs: [build-macos, build-linux, verify]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Take the archives the builds produced
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: mariadb-archive-*
+          path: archives
+          merge-multiple: true
+
+      - name: Take the sources
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: mariadb-source
+          path: source
+
+      # Published with the CLI the runner already carries, rather than a
+      # third-party action: publishing needs write access to this repository,
+      # and that is not a permission to hand to code we do not control.
+      #
+      # The names and digests are worked out here from the validated version
+      # and the files themselves, not taken from the builds, whose outputs
+      # their code wrote. Every platform or none: a release the catalogue could
+      # pin part of would leave the rest a missing URL.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          SHA256: ${{ inputs.sha256 }}
+        run: |
+          set -euo pipefail
+          source_archive="source/mariadb-${VERSION}.tar.gz"
+          printf '%s  %s\n' "$SHA256" "$source_archive" | sha256sum --check --strict
+
+          assets=()
+          notes="MariaDB ${VERSION} built from its source release with OpenSSL (as wolfSSL), PCRE2, zlib and fmt compiled in, and without the engines and plugins that need further libraries. Sources: mariadb-${VERSION}.tar.gz (GPL-2.0) and the PCRE2 and fmt archives its build downloads."
+          for triple in aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            archive="archives/mariadb-${VERSION}-${triple}.tar.gz"
+            [ -f "$archive" ] || { echo "the ${triple} archive is missing" >&2; exit 1; }
+            assets+=("$archive")
+            notes="${notes}
+
+          ${triple}: \`$(sha256sum "$archive" | awk '{print $1}')\`"
+          done
+
+          for source_file in "$source_archive" source/bundled/*.zip; do
+            name="${source_file##*/}"
+            if [ "$source_file" != "$source_archive" ]; then
+              expected="$(printf '%s\n' "$BUNDLED_SHA256" | awk -v name="$name" '$2 == name {print $1}')"
+              printf '%s  %s\n' "$expected" "$source_file" | sha256sum --check --strict
+            fi
+            assets+=("$source_file")
+            notes="${notes}
+
+          ${name}: \`$(sha256sum "$source_file" | awk '{print $1}')\`"
+          done
+
+          gh release create "mariadb-${VERSION}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "MariaDB ${VERSION}" \
+            --notes "$notes" \
+            "${assets[@]}"

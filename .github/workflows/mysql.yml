@@ -1,0 +1,536 @@
+# Repackages MySQL's own generic builds in the layout the catalogue expects:
+# the server, the client tools Stack exposes, and what they load.
+#
+# Oracle's Linux builds link libaio.so.1 and libnuma.so.1, which a base system
+# lacks and Ubuntu 24.04 renamed to libaio.so.1t64. The Linux archives carry
+# both in lib/private, where every binary already looks first, built from the
+# sources Debian ships. The mysql client also names libncurses.so.6, but calls
+# only the termcap functions of libtinfo.so.6, which bash needs on every
+# distribution, so that name is dropped rather than another library carried.
+#
+# MySQL is GPL-2.0, so the release carries the source it was built from, and
+# the LGPL sources of the two libraries added to it.
+#
+# Run it for a release on the 8.4 or 9.7 LTS line with the MD5 digests listed
+# for it on https://dev.mysql.com/downloads/mysql/ (choose the version under
+# "Archives" for one no longer current): macOS 15 (ARM, 64-bit) Compressed TAR
+# Archive, Linux - Generic glibc 2.28 (x86, 64-bit) Compressed TAR Archive,
+# Minimal Install, Linux - Generic glibc 2.28 (ARM, 64-bit) Compressed TAR
+# Archive, and Source Code, All Operating Systems (Generic Linux). Then take the
+# digests it prints into the catalogue entry.
+name: MySQL
+
+run-name: MySQL ${{ inputs.version }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: MySQL release on the 8.4 or 9.7 line, such as 8.4.13
+        required: true
+        default: "8.4.13"
+      md5_macos:
+        description: MD5 of mysql-<version>-macos15-arm64.tar.gz
+        required: true
+      md5_linux_x86_64:
+        description: MD5 of mysql-<version>-linux-glibc2.28-x86_64-minimal.tar.xz
+        required: true
+      md5_linux_aarch64:
+        description: MD5 of mysql-<version>-linux-glibc2.28-aarch64.tar.xz
+        required: true
+      md5_source:
+        description: MD5 of mysql-<version>.tar.gz
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  # MySQL Release Engineering <mysql-build@oss.oracle.com>, the key MySQL's
+  # reference manual names in "Signature Checking Using GnuPG" for 8.4 and
+  # 9.x releases. openpgp-check.sh accepts a signature only under this primary
+  # key, whatever the keyserver returns.
+  MYSQL_SIGNING_KEY: "BCA43417C3B485DD128EC6D4B7B3B788A8D3785C"
+  # The sha256 Debian's signed .dsc lists for each orig tarball.
+  LIBAIO_VERSION: "0.3.113"
+  LIBAIO_SHA256: "2c44d1c5fd0d43752287c9ae1eb9c023f04ef848ea8d4aafa46e9aedb678200b"
+  NUMACTL_VERSION: "2.0.19"
+  NUMACTL_SHA256: "8b84ffdebfa0d730fb2fc71bb7ec96bb2d38bf76fb67246fde416a68e04125e4"
+
+jobs:
+  # Everything is downloaded and checked once, here, where gpg is at hand, and
+  # the builds take the files from this job rather than from the network.
+  download:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Refuse a malformed version or digest
+        env:
+          VERSION: ${{ inputs.version }}
+          MD5_MACOS: ${{ inputs.md5_macos }}
+          MD5_LINUX_X86_64: ${{ inputs.md5_linux_x86_64 }}
+          MD5_LINUX_AARCH64: ${{ inputs.md5_linux_aarch64 }}
+          MD5_SOURCE: ${{ inputs.md5_source }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$VERSION" =~ ^(8\.4|9\.7)\.[0-9]+$ ]]; then
+            echo "the version must be a release on the 8.4 or 9.7 line, like 8.4.13" >&2
+            exit 1
+          fi
+          for digest in "$MD5_MACOS" "$MD5_LINUX_X86_64" "$MD5_LINUX_AARCH64" "$MD5_SOURCE"; do
+            if [[ ! "$digest" =~ ^[0-9a-f]{32}$ ]]; then
+              echo "every MD5 must be the 32 lower-case hex digits dev.mysql.com lists" >&2
+              exit 1
+            fi
+          done
+
+      # Pinned to a commit rather than a tag. A tag moves, and official is a
+      # much smaller risk than a third party's, not no risk.
+      - name: Check out this repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      # A release moves from Downloads to archives once the next one is out.
+      - name: Download MySQL and check each file against its MD5 and signature
+        env:
+          VERSION: ${{ inputs.version }}
+          MD5_MACOS: ${{ inputs.md5_macos }}
+          MD5_LINUX_X86_64: ${{ inputs.md5_linux_x86_64 }}
+          MD5_LINUX_AARCH64: ${{ inputs.md5_linux_aarch64 }}
+          MD5_SOURCE: ${{ inputs.md5_source }}
+        run: |
+          set -euo pipefail
+          series="${VERSION%.*}"
+          mkdir -p upstream/aarch64-apple-darwin upstream/x86_64-unknown-linux-gnu \
+            upstream/aarch64-unknown-linux-gnu upstream/source
+
+          fetch() {
+            local name="$1"
+            local directory="$2"
+            local expected_md5="$3"
+            local found=no
+            local base
+            for base in "https://cdn.mysql.com/Downloads/MySQL-${series}" "https://cdn.mysql.com/archives/mysql-${series}"; do
+              if curl -fsSL --proto '=https' --proto-redir '=https' -o "${directory}/${name}" "${base}/${name}"; then
+                curl -fsSL --proto '=https' --proto-redir '=https' -o "${directory}/${name}.asc" "${base}/${name}.asc"
+                found=yes
+                break
+              fi
+              echo "${name} is not under ${base}"
+            done
+            if [ "$found" != yes ]; then
+              echo "cdn.mysql.com has no ${name}" >&2
+              exit 1
+            fi
+            printf '%s  %s\n' "$expected_md5" "${directory}/${name}" | md5sum --check --strict
+            bash openpgp-check.sh "$MYSQL_SIGNING_KEY" "${directory}/${name}.asc" "${directory}/${name}"
+            rm "${directory}/${name}.asc"
+          }
+
+          fetch "mysql-${VERSION}-macos15-arm64.tar.gz" upstream/aarch64-apple-darwin "$MD5_MACOS"
+          fetch "mysql-${VERSION}-linux-glibc2.28-x86_64-minimal.tar.xz" upstream/x86_64-unknown-linux-gnu "$MD5_LINUX_X86_64"
+          fetch "mysql-${VERSION}-linux-glibc2.28-aarch64.tar.xz" upstream/aarch64-unknown-linux-gnu "$MD5_LINUX_AARCH64"
+          fetch "mysql-${VERSION}.tar.gz" upstream/source "$MD5_SOURCE"
+
+      - name: Download libaio and numactl
+        run: |
+          set -euo pipefail
+          mkdir -p upstream/bundled
+          curl -fsSL --proto '=https' --proto-redir '=https' -o "upstream/bundled/libaio_${LIBAIO_VERSION}.orig.tar.gz" \
+            "https://deb.debian.org/debian/pool/main/liba/libaio/libaio_${LIBAIO_VERSION}.orig.tar.gz"
+          curl -fsSL --proto '=https' --proto-redir '=https' -o "upstream/bundled/numactl_${NUMACTL_VERSION}.orig.tar.gz" \
+            "https://deb.debian.org/debian/pool/main/n/numactl/numactl_${NUMACTL_VERSION}.orig.tar.gz"
+          printf '%s  %s\n%s  %s\n' \
+            "$LIBAIO_SHA256" "upstream/bundled/libaio_${LIBAIO_VERSION}.orig.tar.gz" \
+            "$NUMACTL_SHA256" "upstream/bundled/numactl_${NUMACTL_VERSION}.orig.tar.gz" \
+            | sha256sum --check --strict
+
+      # Compressed archives gain nothing from the artifact's own compression.
+      - name: Hand the macOS build to its packaging job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mysql-upstream-aarch64-apple-darwin
+          path: upstream/aarch64-apple-darwin
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+      - name: Hand the Linux x86_64 build to its packaging job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mysql-upstream-x86_64-unknown-linux-gnu
+          path: upstream/x86_64-unknown-linux-gnu
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+      - name: Hand the Linux aarch64 build to its packaging job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mysql-upstream-aarch64-unknown-linux-gnu
+          path: upstream/aarch64-unknown-linux-gnu
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+      - name: Hand the MySQL source to the release job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mysql-source
+          path: upstream/source
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+      - name: Hand libaio and numactl to the Linux packaging and release jobs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mysql-bundled-sources
+          path: upstream/bundled
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  package-macos:
+    needs: download
+    # macos-14 and later are Apple silicon. This project supports no Intel Macs.
+    # Oracle's "macos15" build sets its minimum to macOS 14.0, so it runs here.
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Take the verified upstream build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: mysql-upstream-aarch64-apple-darwin
+          path: upstream
+
+      - name: Assemble the tree
+        id: assemble
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          root="mysql-${VERSION}-aarch64-apple-darwin"
+          mkdir upstream-tree
+          tar -xzf "upstream/mysql-${VERSION}-macos15-arm64.tar.gz" -C upstream-tree --strip-components 1
+          sh mysql-assemble.sh upstream-tree "$root"
+          echo "root=${root}" >> "$GITHUB_OUTPUT"
+
+      # Stripping invalidates Oracle's signature, and an arm64 binary without
+      # at least an ad-hoc one is killed by the kernel. -x keeps the global
+      # symbols plugins resolve against mysqld.
+      - name: Strip and sign every binary
+        env:
+          ROOT: ${{ steps.assemble.outputs.root }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' file; do
+            if [ "$(od -An -tx1 -N4 "$file" | tr -d ' \n')" = cffaedfe ]; then
+              strip -S -x "$file"
+              codesign --force --sign - "$file"
+            fi
+          done < <(find "$ROOT" -type f -print0)
+
+      # Without the two flags bsdtar adds an AppleDouble ._ entry for every file
+      # carrying an extended attribute.
+      - name: Pack
+        id: package
+        env:
+          ROOT: ${{ steps.assemble.outputs.root }}
+        run: |
+          set -euo pipefail
+          COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -czf "${ROOT}.tar.gz" "$ROOT"
+          echo "archive=${ROOT}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "SHA-256 for the catalogue entry (aarch64-apple-darwin): $(shasum -a 256 "${ROOT}.tar.gz" | awk '{print $1}')"
+
+      - name: Check it runs from another directory without where it was built
+        env:
+          VERSION: ${{ inputs.version }}
+          ROOT: ${{ steps.assemble.outputs.root }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/extracted"
+          tar -xzf "$ARCHIVE" -C "$RUNNER_TEMP/extracted"
+          rm -rf "$ROOT" upstream-tree
+          bash relocatable-check.sh "$RUNNER_TEMP/extracted/$ROOT"
+          sh mysql-probe.sh "$RUNNER_TEMP/extracted/$ROOT" "$(mktemp -d /tmp/mysql-probe.XXXXXX)" "$VERSION"
+
+      - name: Hand the archive to the release job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mysql-archive-aarch64-apple-darwin
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+          compression-level: 0
+
+  package-linux:
+    needs: download
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - triple: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            upstream: linux-glibc2.28-x86_64-minimal
+          # Oracle publishes no minimal build for ARM; the full one carries the
+          # debug server and test plugins, which the assembly leaves out.
+          - triple: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            upstream: linux-glibc2.28-aarch64
+    runs-on: ${{ matrix.runner }}
+    # The oldest distribution supported, so the two libraries built here ask
+    # for no newer glibc than it has.
+    container: ubuntu:22.04
+    timeout-minutes: 30
+    steps:
+      - name: Install the build tools
+        run: |
+          set -eu
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            build-essential patchelf xz-utils
+
+      - name: Check out this repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Take the verified upstream build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: mysql-upstream-${{ matrix.triple }}
+          path: upstream
+
+      - name: Take the verified libaio and numactl sources
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: mysql-bundled-sources
+          path: bundled
+
+      - name: Assemble the tree
+        id: assemble
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          TRIPLE: ${{ matrix.triple }}
+          UPSTREAM: ${{ matrix.upstream }}
+        run: |
+          set -euo pipefail
+          root="mysql-${VERSION}-${TRIPLE}"
+          mkdir upstream-tree
+          tar -xJf "upstream/mysql-${VERSION}-${UPSTREAM}.tar.xz" -C upstream-tree --strip-components 1
+          sh mysql-assemble.sh upstream-tree "$root"
+          rm -rf upstream-tree
+          echo "root=${root}" >> "$GITHUB_OUTPUT"
+
+      - name: Strip every binary
+        shell: bash
+        env:
+          ROOT: ${{ steps.assemble.outputs.root }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' file; do
+            if [ "$(od -An -tx1 -N4 "$file" | tr -d ' \n')" = 7f454c46 ]; then
+              strip --strip-unneeded "$file"
+            fi
+          done < <(find "$ROOT" -type f -print0)
+
+      - name: Drop the mysql client's unused libncurses
+        shell: bash
+        env:
+          ROOT: ${{ steps.assemble.outputs.root }}
+        run: |
+          set -euo pipefail
+          if readelf -d "$ROOT/bin/mysql" | grep -q 'NEEDED.*\[libncurses\.so\.6\]'; then
+            patchelf --remove-needed libncurses.so.6 "$ROOT/bin/mysql"
+          fi
+
+      - name: Put libaio and libnuma beside the bundled libraries
+        shell: bash
+        env:
+          ROOT: ${{ steps.assemble.outputs.root }}
+        run: |
+          set -euo pipefail
+          printf '%s  %s\n%s  %s\n' \
+            "$LIBAIO_SHA256" "bundled/libaio_${LIBAIO_VERSION}.orig.tar.gz" \
+            "$NUMACTL_SHA256" "bundled/numactl_${NUMACTL_VERSION}.orig.tar.gz" \
+            | sha256sum --check --strict
+          mkdir libaio-source numactl-source
+          tar -xzf "bundled/libaio_${LIBAIO_VERSION}.orig.tar.gz" -C libaio-source --strip-components 1
+          tar -xzf "bundled/numactl_${NUMACTL_VERSION}.orig.tar.gz" -C numactl-source --strip-components 1
+
+          make -C libaio-source/src -j"$(nproc)"
+          (cd numactl-source && ./configure --disable-static --quiet && make -j"$(nproc)" libnuma.la)
+
+          strip --strip-unneeded -o "$ROOT/lib/private/libaio.so.1" libaio-source/src/libaio.so.1.0.2
+          strip --strip-unneeded -o "$ROOT/lib/private/libnuma.so.1" numactl-source/.libs/libnuma.so.1.0.0
+          mkdir -p "$ROOT/share/licenses/libaio" "$ROOT/share/licenses/numactl"
+          cp libaio-source/COPYING "$ROOT/share/licenses/libaio/COPYING"
+          cp numactl-source/LICENSE.LGPL2.1 "$ROOT/share/licenses/numactl/LICENSE.LGPL2.1"
+
+          for library in libaio.so.1 libnuma.so.1; do
+            resolved="$(ldd "$ROOT/bin/mysqld" | awk -v name="$library" '$1 == name {print $3}')"
+            if [ "$resolved" != "$(pwd)/$ROOT/bin/../lib/private/${library}" ]; then
+              echo "mysqld finds ${library} at ${resolved:-nowhere}, not in lib/private" >&2
+              exit 1
+            fi
+          done
+
+      # The same bytes for the same inputs, so a second run can be checked
+      # against the first.
+      - name: Pack
+        id: package
+        env:
+          ROOT: ${{ steps.assemble.outputs.root }}
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          set -eu
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+            --mtime='2000-01-01 00:00:00 UTC' -cf - "$ROOT" | gzip -n -9 > "${ROOT}.tar.gz"
+          echo "archive=${ROOT}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "SHA-256 for the catalogue entry (${TRIPLE}): $(sha256sum "${ROOT}.tar.gz" | awk '{print $1}')"
+
+      # The probe runs on clean distributions in the verify job; this one has
+      # the build tools the check reads binaries with.
+      - name: Check it does not depend on where it was built
+        shell: bash
+        env:
+          ROOT: ${{ steps.assemble.outputs.root }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/extracted"
+          tar -xzf "$ARCHIVE" -C "$RUNNER_TEMP/extracted"
+          bash relocatable-check.sh "$RUNNER_TEMP/extracted/$ROOT"
+
+      - name: Hand the archive to the verify and release jobs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mysql-archive-${{ matrix.triple }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+          compression-level: 0
+
+  # Each Linux archive runs on the oldest and newest distributions supported,
+  # none of which has libaio or libnuma installed; Ubuntu 24.04 and later would
+  # only offer libaio.so.1t64.
+  verify:
+    needs: package-linux
+    strategy:
+      fail-fast: false
+      matrix:
+        triple: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
+        image: ["ubuntu:22.04", "ubuntu:24.04", "ubuntu:26.04", "debian:12"]
+        include:
+          - triple: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - triple: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.image }}
+    timeout-minutes: 15
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Take the archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: mysql-archive-${{ matrix.triple }}
+          path: archive
+
+      # mysqld refuses to run as root.
+      - name: Check it initialises, serves and shuts down
+        env:
+          VERSION: ${{ inputs.version }}
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          set -eu
+          useradd --create-home probe
+          cp mysql-probe.sh "archive/mysql-${VERSION}-${TRIPLE}.tar.gz" /home/probe/
+          chown probe /home/probe/mysql-probe.sh "/home/probe/mysql-${VERSION}-${TRIPLE}.tar.gz"
+          su probe -c "tar -xzf '/home/probe/mysql-${VERSION}-${TRIPLE}.tar.gz' -C /home/probe"
+          su probe -c "sh /home/probe/mysql-probe.sh '/home/probe/mysql-${VERSION}-${TRIPLE}' /home/probe/work '${VERSION}'"
+
+  # The only job that can write to this repository. The packaging runs
+  # libaio's and numactl's builds, so this one checks nothing out and runs
+  # nothing they produced; it only moves the archives and sources into the
+  # release.
+  release:
+    needs: [package-macos, package-linux, verify]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Take the archives the packaging produced
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: mysql-archive-*
+          path: archives
+          merge-multiple: true
+
+      - name: Take the sources
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: mysql-*source*
+          path: sources
+          merge-multiple: true
+
+      # Published with the CLI the runner already carries, rather than a
+      # third-party action: publishing needs write access to this repository,
+      # and that is not a permission to hand to code we do not control.
+      #
+      # The names and digests are worked out here from the validated version
+      # and the files themselves, not taken from the builds, whose outputs
+      # their code wrote. Every platform or none: a release the catalogue could
+      # pin part of would leave the rest a missing URL.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          MD5_SOURCE: ${{ inputs.md5_source }}
+        run: |
+          set -euo pipefail
+          source_archive="sources/mysql-${VERSION}.tar.gz"
+          libaio_source="sources/libaio_${LIBAIO_VERSION}.orig.tar.gz"
+          numactl_source="sources/numactl_${NUMACTL_VERSION}.orig.tar.gz"
+          printf '%s  %s\n' "$MD5_SOURCE" "$source_archive" | md5sum --check --strict
+          printf '%s  %s\n%s  %s\n' \
+            "$LIBAIO_SHA256" "$libaio_source" "$NUMACTL_SHA256" "$numactl_source" \
+            | sha256sum --check --strict
+
+          assets=()
+          notes="Oracle's generic MySQL ${VERSION} builds with the server, mysql, mysqldump, mysqladmin and mysql_tzinfo_to_sql, the plugins they load and the server's messages and character sets. The Linux archives add libaio ${LIBAIO_VERSION} and libnuma from numactl ${NUMACTL_VERSION} in lib/private, because base systems lack them and Ubuntu 24.04 renamed libaio. Sources: mysql-${VERSION}.tar.gz (GPL-2.0), and the Debian orig tarballs of libaio and numactl (LGPL-2.1)."
+          for triple in aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            archive="archives/mysql-${VERSION}-${triple}.tar.gz"
+            [ -f "$archive" ] || { echo "the ${triple} archive is missing" >&2; exit 1; }
+            assets+=("$archive")
+            notes="${notes}
+
+          ${triple}: \`$(sha256sum "$archive" | awk '{print $1}')\`"
+          done
+          for source_file in "$source_archive" "$libaio_source" "$numactl_source"; do
+            assets+=("$source_file")
+            notes="${notes}
+
+          ${source_file#sources/}: \`$(sha256sum "$source_file" | awk '{print $1}')\`"
+          done
+
+          gh release create "mysql-${VERSION}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "MySQL ${VERSION}" \
+            --notes "$notes" \
+            "${assets[@]}"
