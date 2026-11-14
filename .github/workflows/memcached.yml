@@ -33,8 +33,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # The sha256 GitHub publishes for the release asset.
   LIBEVENT_VERSION: "2.1.13-stable"
+  # The sha256 GitHub publishes for the release asset.
   LIBEVENT_SHA256: "f7e9383b8c0baa81b687e5b5eecc01beefaf1b19b64151d95ed61647fe7a315c"
   # Nick Mathewson, libevent's author, who signed 2.1.13 with a subkey of this
   # key; the fingerprint is the one Tor's README lists for him.

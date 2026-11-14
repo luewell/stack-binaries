@@ -23,13 +23,21 @@ GNUPGHOME="$(mktemp -d)"
 export GNUPGHOME
 trap 'rm -rf "$GNUPGHOME"' EXIT
 
-curl -fsSL --proto '=https' --proto-redir '=https' -o "$GNUPGHOME/key.asc" \
+curl -fsSL --proto '=https' --proto-redir '=https' --max-time 60 --retry 3 --retry-all-errors \
+  -o "$GNUPGHOME/key.asc" \
   "https://keyserver.ubuntu.com/pks/lookup?op=get&options=mr&search=0x${fingerprint}"
 gpg --batch --quiet --import "$GNUPGHOME/key.asc"
 
 if ! status="$(gpg --batch --status-fd 1 --verify "$signature" "$signed_file" 2>"$GNUPGHOME/verify.log")"; then
   cat "$GNUPGHOME/verify.log" >&2
   echo "${signed_file##*/} does not carry a good signature" >&2
+  exit 1
+fi
+
+# gpg reports a signature by an expired or revoked key as good but adds one of
+# these lines; a release signed that way is not trusted.
+if printf '%s\n' "$status" | awk '$2 ~ /^(EXPKEYSIG|REVKEYSIG|EXPSIG)$/ {found = 1} END {exit !found}'; then
+  echo "${signed_file##*/} is signed by an expired or revoked key" >&2
   exit 1
 fi
 
