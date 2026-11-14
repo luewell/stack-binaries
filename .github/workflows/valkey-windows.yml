@@ -2,8 +2,10 @@
 #
 # Valkey builds against MSYS2's POSIX runtime, which emulates the fork and unix
 # sockets it relies on; the runtime's two libraries ship beside the binaries.
-# Run it for a version, then take the digest it prints into the catalogue entry
-# in the stack repository.
+# Run it for a version and the commit its tag points to, from
+#   git ls-remote https://github.com/valkey-io/valkey 'refs/tags/<version>^{}'
+# (a lightweight tag lists only refs/tags/<version>), then take the digest it
+# prints into the catalogue entry in the stack repository.
 name: Valkey for Windows
 
 on:
@@ -13,6 +15,9 @@ on:
         description: Valkey version to build, without the leading v
         required: true
         default: "9.1.1"
+      commit:
+        description: Full commit SHA the version's tag points to in valkey-io/valkey
+        required: true
 
 permissions:
   contents: read
@@ -31,13 +36,18 @@ jobs:
       run:
         shell: bash
     steps:
-      - name: Refuse a version that is not a release number
+      - name: Refuse a malformed version or commit
         env:
           VERSION: ${{ inputs.version }}
+          COMMIT: ${{ inputs.commit }}
         run: |
           set -euo pipefail
           if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "the version must be a release like 9.1.1, without the leading v" >&2
+            exit 1
+          fi
+          if [[ ! "$COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "the commit must be the full 40-character SHA the tag points to" >&2
             exit 1
           fi
 
@@ -45,8 +55,24 @@ jobs:
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           repository: valkey-io/valkey
-          ref: ${{ inputs.version }}
+          ref: ${{ inputs.commit }}
           persist-credentials: false
+
+      # The build is pinned to the commit the operator looked up, and the tag
+      # must still name it: a tag that moved since then stops the build.
+      - name: Check the tag still points to the commit
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          COMMIT: ${{ inputs.commit }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "refs/tags/${VERSION}:refs/tags/${VERSION}"
+          tagged="$(git rev-parse "refs/tags/${VERSION}^{commit}")"
+          if [ "$tagged" != "$COMMIT" ] || [ "$(git rev-parse HEAD)" != "$COMMIT" ]; then
+            echo "tag ${VERSION} points to ${tagged}, not ${COMMIT}" >&2
+            exit 1
+          fi
 
       # The runner image carries MSYS2 at C:\msys64; its compiler builds for
       # the msys runtime rather than natively. _GNU_SOURCE declares dladdr,
@@ -144,6 +170,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}
+          COMMIT: ${{ inputs.commit }}
         run: |
           set -euo pipefail
           archive="valkey-${VERSION}-windows-x86_64.zip"
@@ -151,7 +178,7 @@ jobs:
           gh release create "valkey-${VERSION}-windows" \
             --repo "$GITHUB_REPOSITORY" \
             --title "Valkey ${VERSION} for Windows" \
-            --notes "Built from valkey-io/valkey ${VERSION} with MSYS2 on Windows x64, because upstream publishes no Windows binary. The archive carries MSYS2's runtime libraries; NOTICE-runtime.txt names them and their sources.
+            --notes "Built from valkey-io/valkey ${VERSION} (commit ${COMMIT}) with MSYS2 on Windows x64, because upstream publishes no Windows binary. The archive carries MSYS2's runtime libraries; NOTICE-runtime.txt names them and their sources.
 
           SHA-256: \`${digest}\`" \
             "$archive"
