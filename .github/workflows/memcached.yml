@@ -111,8 +111,12 @@ jobs:
 
   build-macos:
     needs: download
-    # macos-14 and later are Apple silicon. This project supports no Intel Macs.
-    runs-on: macos-14
+    # macos-15 is Apple silicon; GitHub no longer offers macos-14. This project
+    # supports no Intel Macs.
+    runs-on: macos-15
+    env:
+      # Built on macOS 15, the binaries still have to run on macOS 14.
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
     timeout-minutes: 30
     steps:
       - name: Check out this repository
@@ -211,7 +215,7 @@ jobs:
   build-linux:
     needs: download
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         include:
           - triple: x86_64-unknown-linux-gnu

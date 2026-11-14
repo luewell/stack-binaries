@@ -8,6 +8,7 @@
 # run path must start at $ORIGIN, a dependency must resolve inside the tree or
 # be one every supported distribution installs, the executables in bin/ must
 # bind every symbol, and nothing may ask for a glibc newer than Ubuntu 22.04's.
+# Every Mach-O binary must also run on macOS 14, the oldest supported.
 #
 # Usage: relocatable-check.sh <tree>
 set -euo pipefail
@@ -20,6 +21,7 @@ checked=0
 # libc6 and bash depend on, so no Debian or Ubuntu installation lacks them.
 linux_system_library='^(linux-vdso\.so\.1|ld-linux-(x86-64|aarch64)\.so\.[0-9]+|libc\.so\.6|libm\.so\.6|libdl\.so\.2|libpthread\.so\.0|librt\.so\.1|libresolv\.so\.2|libutil\.so\.1|libstdc\+\+\.so\.6|libgcc_s\.so\.1|libz\.so\.1|libcrypt\.so\.1|libtinfo\.so\.6)$'
 glibc_ceiling="2.35"
+macos_ceiling="14.0"
 
 fail() {
   echo "$1" >&2
@@ -58,10 +60,23 @@ fi
 
 check_macho() {
   local file="$1"
-  local directory own_id own_rpaths entry dependency candidate found
+  local directory own_id own_rpaths minimum entry dependency candidate found
   directory="$(dirname "$file")"
   own_id="$(otool -D "$file" | sed -n 2p)"
   own_rpaths="$(macos_rpaths_of "$file")"
+
+  minimum="$(otool -l "$file" | awk '
+    $1 == "cmd" { command = $2 }
+    (command == "LC_BUILD_VERSION" && $1 == "minos") || (command == "LC_VERSION_MIN_MACOSX" && $1 == "version") { print $2; exit }
+  ')"
+  if [ -z "$minimum" ]; then
+    fail "${file#"$root"/} declares no minimum macOS version"
+  elif ! awk -v found="$minimum" -v ceiling="$macos_ceiling" 'BEGIN {
+    split(found, have, "."); split(ceiling, allowed, ".")
+    exit !((have[1] + 0 < allowed[1] + 0) || (have[1] + 0 == allowed[1] + 0 && have[2] + 0 <= allowed[2] + 0))
+  }'; then
+    fail "${file#"$root"/} needs macOS ${minimum}, newer than ${macos_ceiling}"
+  fi
 
   while IFS= read -r entry; do
     [ -n "$entry" ] || continue

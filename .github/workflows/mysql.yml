@@ -198,9 +198,10 @@ jobs:
 
   package-macos:
     needs: download
-    # macos-14 and later are Apple silicon. This project supports no Intel Macs.
+    # macos-15 is Apple silicon; GitHub no longer offers macos-14. This project
+    # supports no Intel Macs.
     # Oracle's "macos15" build sets its minimum to macOS 14.0, so it runs here.
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
     steps:
       - name: Check out this repository
@@ -277,7 +278,7 @@ jobs:
   package-linux:
     needs: download
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         include:
           - triple: x86_64-unknown-linux-gnu
@@ -299,7 +300,7 @@ jobs:
           set -eu
           apt-get update -qq
           DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-            build-essential patchelf xz-utils
+            build-essential patchelf xz-utils autoconf automake libtool
 
       - name: Check out this repository
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -371,7 +372,7 @@ jobs:
           tar -xzf "bundled/numactl_${NUMACTL_VERSION}.orig.tar.gz" -C numactl-source --strip-components 1
 
           make -C libaio-source/src -j"$(nproc)"
-          (cd numactl-source && ./configure --disable-static --quiet && make -j"$(nproc)" libnuma.la)
+          (cd numactl-source && ./autogen.sh && ./configure --disable-static --quiet && make -j"$(nproc)" libnuma.la)
 
           strip --strip-unneeded -o "$ROOT/lib/private/libaio.so.1" libaio-source/src/libaio.so.1.0.2
           strip --strip-unneeded -o "$ROOT/lib/private/libnuma.so.1" numactl-source/.libs/libnuma.so.1.0.0
