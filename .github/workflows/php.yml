@@ -1,5 +1,7 @@
 # Builds PHP, which nobody publishes with the database drivers a Laravel project
-# needs: the public static builds leave out pdo_pgsql and pdo_mysql.
+# needs: the public static builds leave out pdo_pgsql and pdo_mysql. Each build
+# also carries spx, memcached and opentelemetry, and xdebug.so and pcov.so for
+# Stack to load when a project asks for them.
 #
 # Run it for a version, then take the digests it prints into the catalogue entry
 # in the stack repository.
@@ -7,7 +9,7 @@ name: PHP
 
 # Without this every run is listed as "PHP #7" and three versions building at
 # once are told apart only by opening them.
-run-name: PHP ${{ inputs.version }}${{ inputs.patch && format(' with php-src {0}', inputs.patch) || '' }}
+run-name: PHP ${{ inputs.version }}${{ inputs.patch && format(' with php-src {0}', inputs.patch) || '' }}${{ inputs.revision && format(' revision {0}', inputs.revision) || '' }}
 
 on:
   workflow_dispatch:
@@ -23,6 +25,13 @@ on:
         description: php-src commit, 10 hex digits, whose patches/php-src-<commit>.patch to apply
         required: false
         default: ""
+      # For a release whose files must not change because a published catalogue
+      # pins them, rebuilt with a different extension set. Released as
+      # php-<version>[-<commit>]-r<revision>, beside the first build.
+      revision:
+        description: Rebuild number from 2 up, for a version already released; empty for the first build
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -35,6 +44,7 @@ env:
   # Pinned to a release and to the sha256 GitHub publishes for each asset. spc
   # is a PHP program, so building it here would mean building PHP to build PHP.
   SPC_VERSION: "2.8.5"
+  ZIG_VERSION: "0.16.0"
 
 jobs:
   prepare:
@@ -52,10 +62,17 @@ jobs:
         env:
           ASKED: ${{ inputs.version }}
           PATCH: ${{ inputs.patch }}
+          GH_TOKEN: ${{ github.token }}
+          REVISION: ${{ inputs.revision }}
         run: |
           set -euo pipefail
           if [[ -n "$PATCH" && ! "$PATCH" =~ ^[0-9a-f]{10}$ ]]; then
             echo "the patch must be a php-src commit of 10 hex digits" >&2
+            exit 1
+          fi
+
+          if [[ -n "$REVISION" && ! "$REVISION" =~ ^([2-9]|[1-9][0-9])$ ]]; then
+            echo "the revision must be a number from 2 to 99" >&2
             exit 1
           fi
 
@@ -80,7 +97,15 @@ jobs:
               ;;
           esac
 
-          echo "tag=php-${resolved}${PATCH:+-${PATCH}}" >> "$GITHUB_OUTPUT"
+          tag="php-${resolved}${PATCH:+-${PATCH}}${REVISION:+-r${REVISION}}"
+          # The release job refuses this too; asked here, it costs no build.
+          draft="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft' 2>/dev/null || echo absent)"
+          if [ "$draft" = false ]; then
+            echo "${tag} is already published and its files must not change; run again with the next revision" >&2
+            exit 1
+          fi
+
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "version=${resolved}" >> "$GITHUB_OUTPUT"
           echo "${ASKED} is ${resolved}"
 
@@ -97,14 +122,29 @@ jobs:
             platform: macos-arm64
             spc: spc-macos-aarch64.tar.gz
             digest: acf2f25d56d0cbf8e65aa82e5054fef555f7be7c5c38046c6e0819f266d83225
+          # Linked against glibc 2.17 with spc's zig toolchain: a static musl
+          # PHP cannot load xdebug.so or pcov.so. Stack's Linux MySQL already
+          # needs glibc, so this asks nothing new of the host. Not
+          # native-native-gnu, which tunes for the runner's CPU, nor
+          # SPC_LIBC=glibc, which links against the runner's glibc 2.39.
+          #
+          # The zig digests are the ones ziglang.org/download/index.json
+          # publishes. spc 2.8.5 takes whatever release is newest and checks no
+          # digest; 0.16.0 is the release it was fixed for.
           - runner: ubuntu-24.04
             platform: linux-x86_64
             spc: spc-linux-x86_64.tar.gz
             digest: 523ba4279c54c7a377156c0dd3a36adf92ee64b01e9a7f5e9e2ec084b8e458e5
+            target: x86_64-linux-gnu.2.17
+            zig: zig-x86_64-linux
+            zig-digest: 70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
           - runner: ubuntu-24.04-arm
             platform: linux-arm64
             spc: spc-linux-aarch64.tar.gz
             digest: 675a3840dcdc4ed041fe20eaa54310ce019a9984c1c03951df9ec66df5795213
+            target: aarch64-linux-gnu.2.17
+            zig: zig-aarch64-linux
+            zig-digest: ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17
 
     runs-on: ${{ matrix.runner }}
     # PHP is a long build; GitHub's default ceiling is six hours.
@@ -121,7 +161,8 @@ jobs:
       # retry recompiles OpenSSL, ICU and the rest from nothing.
       #
       # The key covers what decides their content: the spc release, the
-      # extension set, the PHP line and the platform.
+      # extension set and its pinned sources, the PHP line, the platform and
+      # the libc it links against.
       - name: Reuse what was already downloaded and built
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
@@ -129,7 +170,7 @@ jobs:
             downloads
             buildroot
             source
-          key: spc-${{ env.SPC_VERSION }}-php-${{ inputs.version }}${{ inputs.patch && format('-{0}', inputs.patch) || '' }}-${{ matrix.platform }}-${{ hashFiles('craft.yml', 'php-src-patch.php') }}
+          key: spc-${{ env.SPC_VERSION }}-php-${{ inputs.version }}${{ inputs.patch && format('-{0}', inputs.patch) || '' }}-${{ matrix.platform }}${{ matrix.target && format('-{0}', matrix.target) || '' }}-${{ hashFiles('craft.yml', 'php-src-patch.php', 'php-extension-sources.sh') }}
 
       - name: Fetch static-php-cli, and refuse it if it is not what we pinned
         run: |
@@ -154,14 +195,38 @@ jobs:
           chmod +x spc
           ./spc --version
 
+      # Installed from the pinned file before spc looks, so it finds zig in
+      # place and fetches none of its own.
+      - name: Install zig, and refuse it if it is not what we pinned
+        if: runner.os == 'Linux'
+        env:
+          ZIG: ${{ matrix.zig }}
+          ZIG_DIGEST: ${{ matrix.zig-digest }}
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/zig/${ZIG}-${ZIG_VERSION}.tar.xz"
+          mkdir -p "${RUNNER_TEMP}/zig"
+          curl -fsSL --proto '=https' --proto-redir '=https' -o "$archive" \
+            "https://ziglang.org/download/${ZIG_VERSION}/${ZIG}-${ZIG_VERSION}.tar.xz"
+          printf '%s  %s\n' "$ZIG_DIGEST" "$archive" | sha256sum --check --strict
+
+          ./spc install-pkg "$ZIG" --custom-url "${ZIG}:file://${archive}"
+          installed="$("pkgroot/$(uname -m)-linux/zig/zig" version)"
+          if [ "$installed" != "$ZIG_VERSION" ]; then
+            echo "spc installed zig ${installed}, where ${ZIG_VERSION} was pinned" >&2
+            exit 1
+          fi
+
       # The exact version prepare resolved, not the line that was asked for.
       # Resolving it again here would ask a moving source twice: 8.5.10 was
       # released between prepare and the build, so the release said 8.5.9 and
       # the build produced 8.5.10.
       #
       # Only the version line is rewritten; the extension set is reviewed in
-      # craft.yml and is the same for every version and platform.
+      # craft.yml and is the same for every version and platform. The pinned
+      # extension sources are appended, the Xdebug release chosen by PHP line.
       - name: Point craft.yml at the version prepare resolved
+        id: craft
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
           PATCH: ${{ inputs.patch }}
@@ -180,6 +245,11 @@ jobs:
             fi
             printf 'build-options:\n  with-added-patch:\n    - php-src-patch.php\n' >> craft.yml
           fi
+
+          versions="${RUNNER_TEMP}/php-extension-versions"
+          bash php-extension-sources.sh craft.yml "$VERSION" "${RUNNER_TEMP}/php-extension-sources" > "$versions"
+          echo "versions=${versions}" >> "$GITHUB_OUTPUT"
+          cat "$versions"
           cat craft.yml
 
       - name: Build
@@ -190,8 +260,14 @@ jobs:
           # metadata here.
           GITHUB_TOKEN: ${{ github.token }}
           PHP_SRC_PATCH: ${{ inputs.patch && format('{0}/patches/php-src-{1}.patch', github.workspace, inputs.patch) || '' }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
+          # Exported only where set: an empty SPC_TARGET would keep spc from
+          # applying its own macOS default.
+          if [ -n "$TARGET" ]; then
+            export SPC_TARGET="$TARGET"
+          fi
           ./spc craft craft.yml
 
       - name: Check it does not depend on where it was built
@@ -200,7 +276,11 @@ jobs:
           # A binary naming an absolute library path can only ever be installed
           # where it was built. DBngin's Redis hardcodes /Users/Shared/DBngin/...
           # and is pinned to that directory for ever.
-          for binary in buildroot/bin/php buildroot/bin/php-fpm; do
+          #
+          # On Linux everything but glibc is linked in, and nothing may ask for
+          # a glibc newer than the 2.17 it was built against.
+          glibc_library='^(libc\.so\.6|libm\.so\.6|libdl\.so\.2|libpthread\.so\.0|librt\.so\.1|libresolv\.so\.2|libutil\.so\.1|ld-linux-(x86-64|aarch64)\.so\.[0-9]+)$'
+          for binary in buildroot/bin/php buildroot/bin/php-fpm buildroot/modules/xdebug.so buildroot/modules/pcov.so; do
             if [ "$RUNNER_OS" = macOS ]; then
               minimum="$(otool -l "$binary" | awk '$1 == "cmd" { command = $2 } command == "LC_BUILD_VERSION" && $1 == "minos" { print $2; exit }')"
               if [ -z "$minimum" ] || [ "${minimum%%.*}" -gt 14 ]; then
@@ -213,16 +293,43 @@ jobs:
                 exit 1
               fi
               otool -L "$binary"
-            else
-              # A static build has no interpreter at all, which is what we want;
-              # a dynamic one must name nothing under a build directory.
-              if ldd "$binary" 2>&1 | grep -qE '/(home|root|__w)/'; then
-                echo "${binary} links against a path outside the system:" >&2
-                ldd "$binary" >&2
+              continue
+            fi
+
+            interpreter="$(readelf -l "$binary" | sed -n 's/.*\[Requesting program interpreter: \(.*\)\]$/\1/p')"
+            case "${binary}:${interpreter}" in
+              *.so:) ;;
+              */php:/lib64/ld-linux-x86-64.so.2 | */php-fpm:/lib64/ld-linux-x86-64.so.2) ;;
+              */php:/lib/ld-linux-aarch64.so.1 | */php-fpm:/lib/ld-linux-aarch64.so.1) ;;
+              *)
+                echo "${binary} asks for the loader ${interpreter:-of no one}, not the system's glibc loader" >&2
+                exit 1
+                ;;
+            esac
+
+            if readelf -d "$binary" | grep -qE '\((RPATH|RUNPATH)\)'; then
+              echo "${binary} carries a run path:" >&2
+              readelf -d "$binary" >&2
+              exit 1
+            fi
+            for library in $(readelf -d "$binary" | sed -n 's/.*(NEEDED).*\[\(.*\)\]$/\1/p'); do
+              if [[ ! "$library" =~ $glibc_library ]]; then
+                echo "${binary} needs ${library}, which is not part of glibc" >&2
                 exit 1
               fi
-              ldd "$binary" 2>&1 || true
+            done
+
+            newest="$(objdump -T "$binary" | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' | sed 's/^GLIBC_//' | sort -uV | tail -n 1)"
+            if [ -z "$newest" ] && [ "${binary%.so}" = "$binary" ]; then
+              echo "${binary} binds no glibc symbol, so it is not the glibc build" >&2
+              exit 1
             fi
+            if [ -n "$newest" ] && [ "$(printf '%s\n2.17\n' "$newest" | sort -V | tail -n 1)" != 2.17 ]; then
+              echo "${binary} needs glibc ${newest}, newer than 2.17" >&2
+              exit 1
+            fi
+            echo "${binary}: ${interpreter:-no loader}, glibc ${newest:-unversioned}"
+            readelf -d "$binary" | grep '(NEEDED)' || true
           done
 
       - name: Check every extension we asked for is really there
@@ -272,6 +379,20 @@ jobs:
             echo "mbstring carries mbregex", PHP_EOL;
           '
 
+      # Each must load and work, not only be there: Stack loads xdebug.so and
+      # pcov.so by path, and a version other than the pin means spc took a
+      # source of its own.
+      - name: Check the debugging, profiling and tracing extensions work
+        env:
+          VERSIONS: ${{ steps.craft.outputs.versions }}
+        run: |
+          set -euo pipefail
+          bash php-extension-check.sh buildroot/bin/php buildroot/modules "$VERSIONS"
+          if [ ! -f source/php-src/ext/spx/assets/web-ui/index.html ]; then
+            echo "spx's source carries no web UI at assets/web-ui" >&2
+            exit 1
+          fi
+
       - name: Check php-fpm starts and listens
         run: |
           set -euo pipefail
@@ -305,14 +426,18 @@ jobs:
           set -euo pipefail
           version="$(buildroot/bin/php -r 'echo PHP_VERSION;')"
           root="php-${version}-${{ matrix.platform }}"
-          mkdir -p "${root}/bin"
+          mkdir -p "${root}/bin" "${root}/lib/php/extensions" "${root}/share/spx"
           cp buildroot/bin/php buildroot/bin/php-fpm "${root}/bin/"
+          cp buildroot/modules/xdebug.so buildroot/modules/pcov.so "${root}/lib/php/extensions/"
+          cp -R source/php-src/ext/spx/assets/web-ui "${root}/share/spx/web-ui"
 
           if [ "$RUNNER_OS" = macOS ]; then
             # An arm64 binary without at least an ad-hoc signature is killed by
             # the kernel. The linker signs its own output, but copying can drop it.
             codesign --force --sign - "${root}/bin/php"
             codesign --force --sign - "${root}/bin/php-fpm"
+            codesign --force --sign - "${root}/lib/php/extensions/xdebug.so"
+            codesign --force --sign - "${root}/lib/php/extensions/pcov.so"
             digest_of() { shasum -a 256 "$1" | awk '{print $1}'; }
           else
             digest_of() { sha256sum "$1" | awk '{print $1}'; }
@@ -331,14 +456,23 @@ jobs:
           echo "root=${root}" >> "$GITHUB_OUTPUT"
           echo "SHA-256 for the catalogue entry (${{ matrix.platform }}): ${digest}"
 
+      # Unpacked elsewhere than it was built, so a .so that only loads from
+      # buildroot fails here.
       - name: Check it runs after being packed and unpacked
         env:
           ARCHIVE: ${{ steps.package.outputs.archive }}
           ROOT: ${{ steps.package.outputs.root }}
+          VERSIONS: ${{ steps.craft.outputs.versions }}
         run: |
           set -euo pipefail
           tar -xzf "$ARCHIVE" -C "$RUNNER_TEMP"
-          "$RUNNER_TEMP/${ROOT}/bin/php" --version
+          unpacked="$RUNNER_TEMP/${ROOT}"
+          "${unpacked}/bin/php" --version
+          bash php-extension-check.sh "${unpacked}/bin/php" "${unpacked}/lib/php/extensions" "$VERSIONS"
+          if [ ! -f "${unpacked}/share/spx/web-ui/index.html" ]; then
+            echo "the archive carries no SPX web UI at share/spx/web-ui" >&2
+            exit 1
+          fi
 
       - name: Hand the archive to the release job
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -367,6 +501,7 @@ jobs:
       TAG: ${{ needs.prepare.outputs.tag }}
       VERSION: ${{ needs.prepare.outputs.version }}
       PATCH: ${{ inputs.patch }}
+      REVISION: ${{ inputs.revision }}
     steps:
       - name: Take the archives the builds produced
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -379,29 +514,40 @@ jobs:
       # there" and "something went wrong" cannot be branched on.
       #
       # It is made as a draft, so the catalogue cannot pin a URL from it before
-      # every platform is in it. One that is already there, draft or published,
-      # is left as it is. Rebuilding a version replaces its files, and forcing a
-      # published one back to draft would take it from anyone already pointing
-      # at it.
+      # every platform is in it. A draft that is already there is filled again.
+      # A published one is refused: a catalogue may pin its files and their
+      # digests, so a rebuild takes a new revision instead.
       - name: Create the release if it is not there
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "${TAG} is already there"
+            draft="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')"
+            if [ "$draft" != true ]; then
+              echo "${TAG} is already published and its files must not change; run again with the next revision" >&2
+              exit 1
+            fi
+            echo "${TAG} is already there as a draft"
             exit 0
           fi
           title="PHP ${VERSION}"
           patched=""
+          revised=""
           if [ -n "$PATCH" ]; then
-            title="PHP ${VERSION} with php-src ${PATCH}"
+            title="${title} with php-src ${PATCH}"
             patched=" With php-src commit https://github.com/php/php-src/commit/${PATCH} applied, from patches/php-src-${PATCH}.patch."
+          fi
+          if [ -n "$REVISION" ]; then
+            title="${title}, revision ${REVISION}"
+            revised=" Revision ${REVISION} of this PHP release, built again to add extensions; the earlier release keeps its files."
           fi
           gh release create "$TAG" --draft \
             --repo "$GITHUB_REPOSITORY" \
             --title "$title" \
-            --notes "Built with static-php-cli ${SPC_VERSION}, because upstream publishes no build carrying the database drivers.${patched}
+            --notes "Built with static-php-cli ${SPC_VERSION}, because upstream publishes no build carrying the database drivers.${patched}${revised}
+
+          Carries spx, memcached and opentelemetry, and lib/php/extensions/xdebug.so and pcov.so to load with zend_extension= and extension=. share/spx/web-ui holds SPX's web UI. Linux builds need glibc 2.17 or newer.
 
           Each asset's SHA-256 is in the job that produced it."
 

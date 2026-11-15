@@ -1,5 +1,6 @@
 # Builds PHP for Windows with the extensions of the other platforms but gmp,
-# pcntl and posix.
+# pcntl, posix, spx and memcached, and without xdebug.so or pcov.so: Windows
+# has no Xdebug, pcov or SPX for Stack to load.
 #
 # The official Windows builds keep each extension in a DLL that only a php.ini
 # naming it loads, and carry no redis; static-php-cli links them all into
@@ -8,7 +9,7 @@
 # already pins, then take the digest it prints into that entry.
 name: PHP for Windows
 
-run-name: PHP ${{ inputs.version }}${{ inputs.patch && format(' with php-src {0}', inputs.patch) || '' }} for Windows
+run-name: PHP ${{ inputs.version }}${{ inputs.patch && format(' with php-src {0}', inputs.patch) || '' }}${{ inputs.revision && format(' revision {0}', inputs.revision) || '' }} for Windows
 
 on:
   workflow_dispatch:
@@ -19,6 +20,12 @@ on:
       # As in php.yml: released as php-<version>-<commit>-windows.
       patch:
         description: php-src commit, 10 hex digits, whose patches/php-src-<commit>.patch to apply
+        required: false
+        default: ""
+      # As in php.yml: released as php-<version>[-<commit>]-r<revision>-windows,
+      # beside a published release whose files must not change.
+      revision:
+        description: Rebuild number from 2 up, for a version already released; empty for the first build
         required: false
         default: ""
 
@@ -52,6 +59,7 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
           PATCH: ${{ inputs.patch }}
+          REVISION: ${{ inputs.revision }}
         run: |
           set -euo pipefail
           if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -60,6 +68,10 @@ jobs:
           fi
           if [[ -n "$PATCH" && ! "$PATCH" =~ ^[0-9a-f]{10}$ ]]; then
             echo "the patch must be a php-src commit of 10 hex digits" >&2
+            exit 1
+          fi
+          if [[ -n "$REVISION" && ! "$REVISION" =~ ^([2-9]|[1-9][0-9])$ ]]; then
+            echo "the revision must be a number from 2 to 99" >&2
             exit 1
           fi
 
@@ -75,7 +87,7 @@ jobs:
             downloads
             buildroot
             source
-          key: spc-${{ env.SPC_VERSION }}-php-${{ inputs.version }}${{ inputs.patch && format('-{0}', inputs.patch) || '' }}-windows-x86_64-${{ hashFiles('craft.yml', 'php-windows-intl.php', 'php-src-patch.php') }}
+          key: spc-${{ env.SPC_VERSION }}-php-${{ inputs.version }}${{ inputs.patch && format('-{0}', inputs.patch) || '' }}-windows-x86_64-${{ hashFiles('craft.yml', 'php-windows-intl.php', 'php-src-patch.php', 'php-extension-sources.sh') }}
 
       - name: Fetch static-php-cli, and refuse it if it is not what we pinned
         run: |
@@ -95,8 +107,11 @@ jobs:
       # craft.yml stays the one extension set; Windows leaves out the two
       # extensions that exist only on Unix and gmp, whose library static-php-cli
       # does not build for Windows, builds cgi where it has no fpm, and patches
-      # intl before 8.4 (php-windows-intl.php).
+      # intl before 8.4 (php-windows-intl.php). spc 2.8.5 builds no spx for
+      # Windows, has memcached there only as work in progress, and builds no
+      # shared extension there, so xdebug and pcov go too. opentelemetry stays.
       - name: Derive the Windows craft from craft.yml
+        id: craft
         env:
           VERSION: ${{ inputs.version }}
           PATCH: ${{ inputs.patch }}
@@ -107,6 +122,11 @@ jobs:
               -e '/^  - pcntl$/d' \
               -e '/^  - posix$/d' \
               -e '/^  - gmp$/d' \
+              -e '/^  - spx$/d' \
+              -e '/^  - memcached$/d' \
+              -e '/^shared-extensions:$/d' \
+              -e '/^  - xdebug$/d' \
+              -e '/^  - pcov$/d' \
               craft.yml > craft-windows.yml
 
           printf 'build-options:\n  with-added-patch:\n    - php-windows-intl.php\n' >> craft-windows.yml
@@ -125,11 +145,19 @@ jobs:
             echo "PHP_SRC_PATCH_PROGRAM=${program}" >> "$GITHUB_ENV"
           fi
 
-          if grep -qE '^  - (fpm|gmp|pcntl|posix)$' craft-windows.yml || ! grep -qx '  - cgi' craft-windows.yml; then
+          if grep -qE '^(  - (fpm|gmp|pcntl|posix|spx|memcached|xdebug|pcov)|shared-extensions:.*)$' craft-windows.yml \
+            || ! grep -qx '  - cgi' craft-windows.yml \
+            || ! grep -qx '  - opentelemetry' craft-windows.yml; then
             echo "craft.yml no longer has the shape this step rewrites:" >&2
             cat craft-windows.yml >&2
             exit 1
           fi
+
+          temporary="$(cygpath -u "$RUNNER_TEMP")"
+          versions="${temporary}/php-extension-versions"
+          bash php-extension-sources.sh craft-windows.yml "$VERSION" "${temporary}/php-extension-sources" > "$versions"
+          echo "versions=${versions}" >> "$GITHUB_OUTPUT"
+          cat "$versions"
           cat craft-windows.yml
 
       # spc unpacks sources through the tar on PATH, and Git's GNU tar reads
@@ -164,7 +192,7 @@ jobs:
             downloads
             buildroot
             source
-          key: spc-${{ env.SPC_VERSION }}-php-${{ inputs.version }}${{ inputs.patch && format('-{0}', inputs.patch) || '' }}-windows-x86_64-${{ hashFiles('craft.yml', 'php-windows-intl.php', 'php-src-patch.php') }}
+          key: spc-${{ env.SPC_VERSION }}-php-${{ inputs.version }}${{ inputs.patch && format('-{0}', inputs.patch) || '' }}-windows-x86_64-${{ hashFiles('craft.yml', 'php-windows-intl.php', 'php-src-patch.php', 'php-extension-sources.sh') }}
 
       # spc links pgsql and pdo_pgsql against the libpq.dll of EnterpriseDB's
       # PostgreSQL binaries, which it builds against; that DLL and what it
@@ -234,6 +262,8 @@ jobs:
           ) | Set-Content "$env:ROOT\NOTICE-libraries.txt"
 
       - name: Check every extension we asked for is really there
+        env:
+          VERSIONS: ${{ steps.craft.outputs.versions }}
         run: |
           set -euo pipefail
           php="$ROOT/bin/php.exe"
@@ -242,7 +272,7 @@ jobs:
           missing=""
           for extension in ctype curl dom fileinfo filter hash mbstring openssl \
                            pcre pdo session tokenizer xml \
-                           pdo_pgsql pdo_mysql redis intl zip gd bcmath sodium; do
+                           pdo_pgsql pdo_mysql redis intl zip gd bcmath sodium opentelemetry; do
             grep -qx "$extension" present.txt || missing="${missing} ${extension}"
           done
 
@@ -253,6 +283,17 @@ jobs:
           fi
           echo "all required extensions present"
           "$php" -v
+
+          # A version other than the pin means static-php-cli took a source of
+          # its own.
+          while read -r extension expected; do
+            actual="$("$php" -r "echo phpversion('${extension}');" | tr -d '\r')"
+            if [ "$actual" != "$expected" ]; then
+              echo "${extension} reports ${actual:-no version}, where ${expected} was pinned" >&2
+              exit 1
+            fi
+            echo "${extension} ${actual}"
+          done < "$VERSIONS"
 
           "$php" -r '
             $wanted = ["JPEG Support", "PNG Support", "WebP Support", "FreeType Support"];
@@ -347,20 +388,36 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}
           PATCH: ${{ inputs.patch }}
+          REVISION: ${{ inputs.revision }}
         run: |
           set -euo pipefail
           archive="php-${VERSION}-windows-x86_64.zip"
           digest="$(sha256sum "$archive" | awk '{print $1}')"
-          title="PHP ${VERSION} for Windows"
+          tag="php-${VERSION}${PATCH:+-${PATCH}}${REVISION:+-r${REVISION}}-windows"
+
+          # A published release may be pinned by a catalogue with its digest;
+          # its file is never replaced. A rebuild takes the next revision.
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "${tag} is already there and its files must not change; run again with the next revision" >&2
+            exit 1
+          fi
+
+          title="PHP ${VERSION}"
           patched=""
+          revised=""
           if [ -n "$PATCH" ]; then
-            title="PHP ${VERSION} with php-src ${PATCH} for Windows"
+            title="${title} with php-src ${PATCH}"
             patched=" With php-src commit https://github.com/php/php-src/commit/${PATCH} applied, from patches/php-src-${PATCH}.patch."
           fi
-          gh release create "php-${VERSION}${PATCH:+-${PATCH}}-windows" \
+          if [ -n "$REVISION" ]; then
+            title="${title}, revision ${REVISION}"
+            revised=" Revision ${REVISION} of this PHP release, built again to add extensions; the earlier release keeps its file."
+          fi
+          title="${title} for Windows"
+          gh release create "$tag" \
             --repo "$GITHUB_REPOSITORY" \
             --title "$title" \
-            --notes "Built with static-php-cli ${SPC_VERSION} on Windows x64, with the extensions of the other platforms' builds but pcntl and posix, which exist only on Unix, and gmp, whose library static-php-cli does not build for Windows. php-cgi.exe serves FastCGI, since Windows has no php-fpm.${patched}
+            --notes "Built with static-php-cli ${SPC_VERSION} on Windows x64, with the extensions of the other platforms' builds but pcntl and posix, which exist only on Unix, gmp, whose library static-php-cli does not build for Windows, and spx and memcached, which it does not build for Windows either. It carries opentelemetry; there is no Xdebug, pcov or SPX for Windows. php-cgi.exe serves FastCGI, since Windows has no php-fpm.${patched}${revised}
 
           SHA-256: \`${digest}\`" \
             "$archive"

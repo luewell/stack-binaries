@@ -2,7 +2,8 @@
 #
 # Laravel names thirteen extensions and a standard build already has all of
 # them. This list exists for what its list does not name and what the public
-# static builds lack: the database drivers.
+# static builds lack: the database drivers, and what Stack needs to profile,
+# trace, cache in memcached and debug.
 #
 # php-version is rewritten by the workflow. Everything else is the same for
 # every version, so a project moving between them finds the same PHP.
@@ -37,8 +38,12 @@ extensions:
   # --enable-mbregex, without which there is no mb_split, which Laravel's
   # Str::studly calls.
   - mbregex
+  - memcached
   - opcache
   - openssl
+  # Does nothing until a project installs the OpenTelemetry SDK; it is here so
+  # that project need not build it.
+  - opentelemetry
   - pcntl
   - pdo
   - pdo_mysql
@@ -52,6 +57,9 @@ extensions:
   - simplexml
   - sockets
   - sodium
+  # Idle until a request or php.ini enables it. Stack points spx.http_ui_assets_dir
+  # at share/spx/web-ui in the archive.
+  - spx
   - sqlite3
   - tokenizer
   - xml
@@ -59,3 +67,14 @@ extensions:
   - xmlwriter
   - zip
   - zlib
+
+# Loaded only when Stack asks for them: Xdebug and pcov slow every request they
+# are loaded in, and static-php-cli builds them only as shared extensions. A
+# shared extension needs a PHP that can load one, which is why Linux builds
+# against glibc rather than musl. Windows builds neither.
+shared-extensions:
+  - xdebug
+  - pcov
+
+# The sources of spx, memcached, opentelemetry, xdebug and pcov are pinned in
+# php-extension-sources.sh, which the workflows run on this file.
