@@ -270,6 +270,20 @@ jobs:
           fi
           ./spc craft craft.yml
 
+      # The glibc build links everything but glibc in, yet spc leaves a run
+      # path to its own buildroot/lib. The loader would search that directory
+      # first for the glibc libraries, so a machine where it exists could hand
+      # PHP another libc.
+      - name: Drop the run path to the build directory
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends patchelf
+          for binary in buildroot/bin/php buildroot/bin/php-fpm buildroot/modules/xdebug.so buildroot/modules/pcov.so; do
+            patchelf --remove-rpath "$binary"
+          done
+
       - name: Check it does not depend on where it was built
         run: |
           set -euo pipefail
