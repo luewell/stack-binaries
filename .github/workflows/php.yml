@@ -90,8 +90,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macos-14 and later are Apple silicon. This project supports no Intel Macs.
-          - runner: macos-14
+          # macos-15 is Apple silicon; GitHub no longer offers macos-14. This
+          # project supports no Intel Macs. spc's env.ini sets
+          # MACOSX_DEPLOYMENT_TARGET=12.0, so the build still runs on macOS 14.
+          - runner: macos-15
             platform: macos-arm64
             spc: spc-macos-aarch64.tar.gz
             digest: acf2f25d56d0cbf8e65aa82e5054fef555f7be7c5c38046c6e0819f266d83225
@@ -200,6 +202,11 @@ jobs:
           # and is pinned to that directory for ever.
           for binary in buildroot/bin/php buildroot/bin/php-fpm; do
             if [ "$RUNNER_OS" = macOS ]; then
+              minimum="$(otool -l "$binary" | awk '$1 == "cmd" { command = $2 } command == "LC_BUILD_VERSION" && $1 == "minos" { print $2; exit }')"
+              if [ -z "$minimum" ] || [ "${minimum%%.*}" -gt 14 ]; then
+                echo "${binary} needs macOS ${minimum:-of no declared version}, newer than 14.0" >&2
+                exit 1
+              fi
               if otool -L "$binary" | grep -qE '^[[:space:]]+/(Users|opt|usr/local)/'; then
                 echo "${binary} links against a path outside the system:" >&2
                 otool -L "$binary" >&2

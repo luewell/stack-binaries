@@ -291,8 +291,8 @@ jobs:
       matrix:
         include:
           - triple: aarch64-apple-darwin
-            # macos-14 and later are Apple silicon.
-            runner: macos-14
+            # macos-15 is Apple silicon; GitHub no longer offers macos-14.
+            runner: macos-15
           - triple: x86_64-pc-windows-msvc
             runner: windows-2025
     runs-on: ${{ matrix.runner }}
